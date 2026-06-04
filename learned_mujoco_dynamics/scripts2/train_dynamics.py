@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout_loss_discount", default=1.0, type=float)
     parser.add_argument("--direct_loss_steps", default=1, type=int)
     parser.add_argument("--direct_loss_discount", default=1.0, type=float)
+    parser.add_argument("--train_sample_stride", default=1, type=int)
+    parser.add_argument("--val_sample_stride", default=1, type=int)
     return parser.parse_args()
 
 
@@ -324,6 +326,27 @@ def format_delta_rmse(name: str, rmse: torch.Tensor, n_joints: int) -> str:
     return " ".join(parts)
 
 
+def fit_normalizer_with_progress(
+    normalizer: StandardNormalizer,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    deltas: torch.Tensor,
+) -> None:
+    with tqdm(total=6, desc="fit normalizer", unit="stat") as progress:
+        normalizer.state_mean = states.mean(dim=0)
+        progress.update()
+        normalizer.state_std = states.std(dim=0, unbiased=False).clamp_min(normalizer.eps)
+        progress.update()
+        normalizer.action_mean = actions.mean(dim=0)
+        progress.update()
+        normalizer.action_std = actions.std(dim=0, unbiased=False).clamp_min(normalizer.eps)
+        progress.update()
+        normalizer.delta_mean = deltas.mean(dim=0)
+        progress.update()
+        normalizer.delta_std = deltas.std(dim=0, unbiased=False).clamp_min(normalizer.eps)
+        progress.update()
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -464,6 +487,10 @@ def main() -> None:
         raise ValueError(f"direct_loss_steps must be positive, got {args.direct_loss_steps}")
     if args.direct_loss_discount <= 0:
         raise ValueError(f"direct_loss_discount must be positive, got {args.direct_loss_discount}")
+    if args.train_sample_stride <= 0:
+        raise ValueError(f"train_sample_stride must be positive, got {args.train_sample_stride}")
+    if args.val_sample_stride <= 0:
+        raise ValueError(f"val_sample_stride must be positive, got {args.val_sample_stride}")
     if args.q_weight < 0 or args.dq_weight < 0:
         raise ValueError(f"q_weight and dq_weight must be non-negative, got {args.q_weight}, {args.dq_weight}")
     if args.q_weight == 0 and args.dq_weight == 0:
@@ -501,15 +528,26 @@ def main() -> None:
         print(f"q_extra_weights={q_extra_weights.tolist()}", flush=True)
     if dq_extra_weights is not None:
         print(f"dq_extra_weights={dq_extra_weights.tolist()}", flush=True)
-    train_set, val_set = split_dataset(dataset, val_fraction=0.1, seed=args.seed)
-    print(f"split dataset: train={len(train_set)} val={len(val_set)}", flush=True)
+    train_set, val_set = split_dataset(
+        dataset,
+        val_fraction=0.1,
+        seed=args.seed,
+        train_sample_stride=args.train_sample_stride,
+        val_sample_stride=args.val_sample_stride,
+        show_progress=True,
+    )
+    print(
+        f"split dataset: train={len(train_set)} val={len(val_set)} "
+        f"train_sample_stride={args.train_sample_stride} val_sample_stride={args.val_sample_stride}",
+        flush=True,
+    )
 
     print("fitting normalizer", flush=True)
     deltas = dataset.next_states - dataset.states
     if args.target_mode == "delta_dq":
         deltas = deltas[:, dataset.state_dim // 2 :]
     normalizer = StandardNormalizer()
-    normalizer.fit(dataset.states, dataset.actions, deltas)
+    fit_normalizer_with_progress(normalizer, dataset.states, dataset.actions, deltas)
     del deltas
     print("normalizer ready", flush=True)
 
@@ -549,6 +587,8 @@ def main() -> None:
         "rollout_loss_discount": args.rollout_loss_discount,
         "direct_loss_steps": args.direct_loss_steps,
         "direct_loss_discount": args.direct_loss_discount,
+        "train_sample_stride": args.train_sample_stride,
+        "val_sample_stride": args.val_sample_stride,
     }
 
     start_epoch = 1

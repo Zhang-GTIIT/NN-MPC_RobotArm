@@ -6,6 +6,7 @@ from typing import Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset, random_split
+from tqdm import tqdm
 
 
 class DynamicsDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -252,26 +253,80 @@ def split_dataset(
     dataset: DynamicsDataset,
     val_fraction: float = 0.1,
     seed: int = 0,
+    train_sample_stride: int = 1,
+    val_sample_stride: int = 1,
+    show_progress: bool = False,
 ) -> Tuple[Subset[DynamicsDataset], Subset[DynamicsDataset]]:
     if not 0.0 < val_fraction < 1.0:
         raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
+    if train_sample_stride <= 0:
+        raise ValueError(f"train_sample_stride must be positive, got {train_sample_stride}")
+    if val_sample_stride <= 0:
+        raise ValueError(f"val_sample_stride must be positive, got {val_sample_stride}")
+
+    def apply_sample_stride(indices: np.ndarray, stride: int) -> np.ndarray:
+        if stride == 1:
+            return indices.astype(np.int64, copy=False)
+        if dataset.episode_ids is None or dataset.sequence_indices is None:
+            return indices[::stride].astype(np.int64, copy=False)
+        sample_episode_ids = dataset.episode_ids.cpu().numpy()[dataset.sequence_indices]
+        strided_by_episode = [
+            episode_indices[::stride]
+            for episode_id in np.unique(sample_episode_ids[indices])
+            for episode_indices in [indices[sample_episode_ids[indices] == episode_id]]
+        ]
+        if not strided_by_episode:
+            return indices[:1].astype(np.int64, copy=False)
+        return np.concatenate(strided_by_episode).astype(np.int64, copy=False)
+
+    def split_sequence_indices_by_episode() -> tuple[np.ndarray, np.ndarray] | None:
+        if dataset.episode_ids is None or dataset.sequence_indices is None:
+            return None
+        episode_ids = dataset.episode_ids.cpu().numpy()
+        boundaries = np.flatnonzero(np.diff(episode_ids) != 0) + 1
+        run_starts = np.concatenate(([0], boundaries))
+        run_ends = np.concatenate((boundaries, [len(episode_ids)]))
+        run_episode_ids = episode_ids[run_starts]
+        if len(run_episode_ids) < 2:
+            return None
+
+        rng = np.random.default_rng(seed)
+        shuffled = np.unique(run_episode_ids)
+        rng.shuffle(shuffled)
+        val_episode_count = min(len(shuffled) - 1, max(1, int(len(shuffled) * val_fraction)))
+        val_episodes = set(int(episode_id) for episode_id in shuffled[:val_episode_count])
+        sequence_indices = dataset.sequence_indices
+        train_parts: list[np.ndarray] = []
+        val_parts: list[np.ndarray] = []
+        runs = zip(run_starts, run_ends, run_episode_ids)
+        if show_progress:
+            runs = tqdm(list(runs), desc="split episodes", unit="episode")
+        for run_start, run_end, episode_id in runs:
+            sample_start = int(np.searchsorted(sequence_indices, run_start, side="left"))
+            sample_end = int(np.searchsorted(sequence_indices, run_end, side="left"))
+            if sample_start >= sample_end:
+                continue
+            stride = val_sample_stride if int(episode_id) in val_episodes else train_sample_stride
+            indices = np.arange(sample_start, sample_end, stride, dtype=np.int64)
+            if int(episode_id) in val_episodes:
+                val_parts.append(indices)
+            else:
+                train_parts.append(indices)
+        if not train_parts or not val_parts:
+            return None
+        return np.concatenate(train_parts), np.concatenate(val_parts)
+
     val_size = max(1, int(len(dataset) * val_fraction))
     train_size = len(dataset) - val_size
     if train_size <= 0:
         raise ValueError(f"Dataset too small to split: len={len(dataset)}, val_fraction={val_fraction}")
     if dataset.episode_ids is not None and dataset.sequence_indices is not None:
-        sample_episode_ids = dataset.episode_ids.cpu().numpy()[dataset.sequence_indices]
-        unique_episode_ids = np.unique(sample_episode_ids)
-        if len(unique_episode_ids) >= 2:
-            rng = np.random.default_rng(seed)
-            shuffled = unique_episode_ids.copy()
-            rng.shuffle(shuffled)
-            val_episode_count = min(len(shuffled) - 1, max(1, int(len(shuffled) * val_fraction)))
-            val_episodes = shuffled[:val_episode_count]
-            val_mask = np.isin(sample_episode_ids, val_episodes)
-            train_indices = np.flatnonzero(~val_mask).astype(np.int64)
-            val_indices = np.flatnonzero(val_mask).astype(np.int64)
+        episode_split = split_sequence_indices_by_episode()
+        if episode_split is not None:
+            train_indices, val_indices = episode_split
             return Subset(dataset, train_indices), Subset(dataset, val_indices)
     generator = torch.Generator().manual_seed(seed)
     train_set, val_set = random_split(dataset, [train_size, val_size], generator=generator)
-    return train_set, val_set
+    train_indices = apply_sample_stride(np.asarray(train_set.indices, dtype=np.int64), train_sample_stride)
+    val_indices = apply_sample_stride(np.asarray(val_set.indices, dtype=np.int64), val_sample_stride)
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)

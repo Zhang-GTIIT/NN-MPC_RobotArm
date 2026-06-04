@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -17,6 +18,11 @@ from learned_dynamics.normalization import StandardNormalizer
 from learned_dynamics.parallel_collector import sample_smooth_action, save_dataset, validate_append_dataset
 from learned_dynamics.paths import DEFAULT_MODEL_XML, resolve_project_path
 from learned_dynamics.train_utils import load_checkpoint, require_resume_checkpoint, save_checkpoint
+from learned_dynamics2.dataset import (
+    DynamicsDataset as DynamicsDatasetV2,
+    RolloutDynamicsDataset as RolloutDynamicsDatasetV2,
+    split_dataset as split_dataset_v2,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -294,6 +300,190 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertTrue(val_episodes)
         self.assertTrue(train_episodes.isdisjoint(val_episodes))
 
+    def test_split_dataset_can_stride_training_windows_but_keep_full_validation(self) -> None:
+        states = np.arange(96, dtype=np.float32).reshape(48, 2)
+        actions = np.arange(48, dtype=np.float32).reshape(48, 1)
+        next_states = states + 1.0
+        episode_ids = np.repeat(np.arange(4, dtype=np.int64), 12)
+        dataset = DynamicsDataset(
+            states,
+            actions,
+            next_states,
+            model_type="transformer",
+            history_len=4,
+            episode_ids=episode_ids,
+        )
+
+        train_set, val_set = split_dataset(
+            dataset,
+            val_fraction=0.25,
+            seed=0,
+            train_sample_stride=3,
+            val_sample_stride=1,
+        )
+        train_starts = dataset.sequence_indices[train_set.indices]
+        val_starts = dataset.sequence_indices[val_set.indices]
+
+        self.assertTrue(np.all(train_starts % 3 == 0))
+        self.assertEqual(len(train_set), 9)
+        self.assertEqual(len(val_set), 9)
+        self.assertEqual(np.diff(val_starts).tolist(), [1] * (len(val_starts) - 1))
+
+    def test_split_dataset_can_show_episode_progress(self) -> None:
+        states = np.arange(96, dtype=np.float32).reshape(48, 2)
+        actions = np.arange(48, dtype=np.float32).reshape(48, 1)
+        next_states = states + 1.0
+        episode_ids = np.repeat(np.arange(4, dtype=np.int64), 12)
+        dataset = DynamicsDataset(
+            states,
+            actions,
+            next_states,
+            model_type="transformer",
+            history_len=4,
+            episode_ids=episode_ids,
+        )
+
+        with patch("learned_dynamics.dataset.tqdm", side_effect=lambda iterable, **_: iterable) as progress:
+            split_dataset(
+                dataset,
+                val_fraction=0.25,
+                seed=0,
+                train_sample_stride=3,
+                val_sample_stride=1,
+                show_progress=True,
+            )
+
+        self.assertTrue(progress.called)
+        self.assertEqual(progress.call_args.kwargs["desc"], "split episodes")
+
+    def test_v2_split_dataset_can_stride_training_windows_with_direct_loss_steps(self) -> None:
+        states = np.arange(120, dtype=np.float32).reshape(60, 2)
+        actions = np.arange(60, dtype=np.float32).reshape(60, 1)
+        next_states = states + 1.0
+        episode_ids = np.repeat(np.arange(5, dtype=np.int64), 12)
+        dataset = DynamicsDatasetV2(
+            states,
+            actions,
+            next_states,
+            model_type="transformer",
+            history_len=4,
+            episode_ids=episode_ids,
+            direct_loss_steps=2,
+        )
+
+        train_set, val_set = split_dataset_v2(
+            dataset,
+            val_fraction=0.2,
+            seed=0,
+            train_sample_stride=3,
+            val_sample_stride=1,
+        )
+        train_starts = dataset.sequence_indices[train_set.indices]
+        val_starts = dataset.sequence_indices[val_set.indices]
+
+        self.assertTrue(np.all(train_starts % 3 == 0))
+        self.assertEqual(len(train_set), 12)
+        self.assertEqual(len(val_set), 8)
+        self.assertEqual(np.diff(val_starts).tolist(), [1] * (len(val_starts) - 1))
+
+    def test_v2_split_dataset_can_show_episode_progress(self) -> None:
+        states = np.arange(120, dtype=np.float32).reshape(60, 2)
+        actions = np.arange(60, dtype=np.float32).reshape(60, 1)
+        next_states = states + 1.0
+        episode_ids = np.repeat(np.arange(5, dtype=np.int64), 12)
+        dataset = DynamicsDatasetV2(
+            states,
+            actions,
+            next_states,
+            model_type="transformer",
+            history_len=4,
+            episode_ids=episode_ids,
+            direct_loss_steps=2,
+        )
+
+        with patch("learned_dynamics2.dataset.tqdm", side_effect=lambda iterable, **_: iterable) as progress:
+            split_dataset_v2(
+                dataset,
+                val_fraction=0.2,
+                seed=0,
+                train_sample_stride=3,
+                val_sample_stride=1,
+                show_progress=True,
+            )
+
+        self.assertTrue(progress.called)
+        self.assertEqual(progress.call_args.kwargs["desc"], "split episodes")
+
+    def test_rollout_dataset_stride_keeps_rollout_steps_contiguous(self) -> None:
+        states = np.arange(320, dtype=np.float32).reshape(160, 2)
+        actions = np.arange(160, dtype=np.float32).reshape(160, 1)
+        next_states = states + 1.0
+        episode_ids = np.repeat(np.arange(4, dtype=np.int64), 40)
+        dataset = RolloutDynamicsDataset(
+            states,
+            actions,
+            next_states,
+            model_type="transformer",
+            history_len=4,
+            episode_ids=episode_ids,
+            rollout_steps=5,
+        )
+
+        train_set, _ = split_dataset(
+            dataset,
+            val_fraction=0.25,
+            seed=0,
+            train_sample_stride=4,
+            val_sample_stride=1,
+        )
+        sample_index = int(train_set.indices[1])
+        start = int(dataset.sequence_indices[sample_index])
+        current_index = start + dataset.history_len - 1
+        x, _, rollout_actions, rollout_next_states = dataset[sample_index]
+
+        self.assertEqual(start % 4, 0)
+        self.assertTrue(torch.allclose(x[-1, :2], torch.as_tensor(states[current_index])))
+        self.assertTrue(torch.allclose(rollout_actions[:, 0], torch.as_tensor(actions[current_index : current_index + 5, 0])))
+        self.assertTrue(
+            torch.allclose(rollout_next_states[:, 0], torch.as_tensor(next_states[current_index : current_index + 5, 0]))
+        )
+
+    def test_v2_rollout_dataset_stride_keeps_rollout_steps_contiguous(self) -> None:
+        states = np.arange(320, dtype=np.float32).reshape(160, 2)
+        actions = np.arange(160, dtype=np.float32).reshape(160, 1)
+        next_states = states + 1.0
+        episode_ids = np.repeat(np.arange(4, dtype=np.int64), 40)
+        dataset = RolloutDynamicsDatasetV2(
+            states,
+            actions,
+            next_states,
+            model_type="transformer",
+            history_len=4,
+            episode_ids=episode_ids,
+            rollout_steps=5,
+            direct_loss_steps=2,
+        )
+
+        train_set, _ = split_dataset_v2(
+            dataset,
+            val_fraction=0.25,
+            seed=0,
+            train_sample_stride=4,
+            val_sample_stride=1,
+        )
+        sample_index = int(train_set.indices[1])
+        start = int(dataset.sequence_indices[sample_index])
+        current_index = start + dataset.history_len - 1
+        x, y, rollout_actions, rollout_next_states = dataset[sample_index]
+
+        self.assertEqual(start % 4, 0)
+        self.assertEqual(tuple(y.shape), (2, 2))
+        self.assertTrue(torch.allclose(x[-1, :2], torch.as_tensor(states[current_index])))
+        self.assertTrue(torch.allclose(rollout_actions[:, 0], torch.as_tensor(actions[current_index : current_index + 5, 0])))
+        self.assertTrue(
+            torch.allclose(rollout_next_states[:, 0], torch.as_tensor(next_states[current_index : current_index + 5, 0]))
+        )
+
     def test_normalizer_round_trips_tensors(self) -> None:
         states = torch.tensor([[0.0, 2.0], [2.0, 4.0]])
         actions = torch.tensor([[1.0], [3.0]])
@@ -552,6 +742,52 @@ class CoreBehaviorTests(unittest.TestCase):
             self.assertEqual(checkpoint["config"]["rollout_loss_steps"], 3)
             self.assertEqual(checkpoint["config"]["rollout_loss_weight"], 0.1)
 
+    def test_train_script_saves_sample_stride_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_path = tmp_path / "tiny_data.npz"
+            save_dir = tmp_path / "checkpoints"
+            self._write_tiny_dataset(data_path, include_episode_ids=True)
+
+            self._run_train(
+                data_path,
+                save_dir,
+                "--epochs",
+                "1",
+                "--train_sample_stride",
+                "3",
+                "--val_sample_stride",
+                "1",
+            )
+            run_dir = self._single_run_dir(save_dir)
+            checkpoint = load_checkpoint(run_dir / "latest_model.pt")
+
+        self.assertEqual(checkpoint["config"]["train_sample_stride"], 3)
+        self.assertEqual(checkpoint["config"]["val_sample_stride"], 1)
+
+    def test_train_script_v2_saves_sample_stride_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_path = tmp_path / "tiny_data.npz"
+            save_dir = tmp_path / "checkpoints"
+            self._write_tiny_dataset(data_path, include_episode_ids=True)
+
+            self._run_train_v2(
+                data_path,
+                save_dir,
+                "--epochs",
+                "1",
+                "--train_sample_stride",
+                "3",
+                "--val_sample_stride",
+                "1",
+            )
+            run_dir = self._single_run_dir(save_dir)
+            checkpoint = load_checkpoint(run_dir / "latest_model.pt")
+
+        self.assertEqual(checkpoint["config"]["train_sample_stride"], 3)
+        self.assertEqual(checkpoint["config"]["val_sample_stride"], 1)
+
     def test_merge_npz_datasets_concatenates_required_arrays(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -797,6 +1033,25 @@ class CoreBehaviorTests(unittest.TestCase):
         result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
         if result.returncode != 0:
             raise AssertionError(f"train command failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+
+    @staticmethod
+    def _run_train_v2(data_path: Path, save_dir: Path, *extra_args: str) -> None:
+        command = [
+            sys.executable,
+            str(ROOT / "scripts2" / "train_dynamics.py"),
+            "--data_path",
+            str(data_path),
+            "--model_type",
+            "mlp",
+            "--batch_size",
+            "8",
+            "--save_dir",
+            str(save_dir),
+            *extra_args,
+        ]
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise AssertionError(f"train v2 command failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
     @staticmethod
     def _single_run_dir(save_dir: Path) -> Path:

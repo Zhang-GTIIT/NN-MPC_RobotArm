@@ -439,8 +439,8 @@ python scripts2/eval_dynamics.py \
   --horizons 1,5,10,20,50,100,200 
 
 python scripts/eval_dynamics.py \
-  --checkpoint outputs/checkpoints_transformer/transformer_20260603_230016/best_model.pt \
-  --normalizer outputs/checkpoints_transformer/transformer_20260603_230016/normalizer.pt \
+  --checkpoint outputs/checkpoints_transformer/transformer_20260604_153548/best_model.pt \
+  --normalizer outputs/checkpoints_transformer/transformer_20260604_153548/normalizer.pt \
   --model_type transformer \
   --n_joints 6 \
   --history_len 16 \
@@ -450,7 +450,7 @@ python scripts/eval_dynamics.py \
   --warmup_steps 50 \
   --horizons 1,5,10,20,50,100,200 \
   --teacher_forcing \
-  --save_dir outputs/figures/transformer_v3
+  --save_dir outputs/figures/transformer_20260604_153548
 
 ```
 
