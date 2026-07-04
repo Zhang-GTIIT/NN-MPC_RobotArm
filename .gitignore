@@ -2,6 +2,8 @@
 /.codex
 /.vscode
 /.pytest_cache
+/outputs
+/docs
 
 /learned_mujoco_dynamics/__py/cache__
 /learned_mujoco_dynamics/.codex

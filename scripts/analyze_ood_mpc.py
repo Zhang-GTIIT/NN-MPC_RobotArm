@@ -40,12 +40,17 @@ def parse_pair(value: str) -> tuple[str, Path, Path]:
 
 def resolve_runtime_path(path: str) -> Path:
     expanded = Path(path).expanduser()
-    if expanded.is_absolute() or expanded.exists():
+    if expanded.is_absolute():
         return expanded
+    root_path = ROOT / expanded
+    if root_path.exists() or (expanded.parts and expanded.parts[0] == "learned_mujoco_dynamics"):
+        return root_path
     dynamics_path = DYNAMICS_ROOT / expanded
-    if dynamics_path.exists() or (expanded.parts and expanded.parts[0] == "outputs"):
+    if dynamics_path.exists():
         return dynamics_path
-    return expanded
+    if expanded.parts and expanded.parts[0] == "outputs":
+        return root_path
+    return root_path
 
 
 def load_training_distribution(dataset_path: Path) -> dict[str, np.ndarray]:

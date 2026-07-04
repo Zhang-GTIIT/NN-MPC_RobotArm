@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import importlib.util
 import sys
 import unittest
 from pathlib import Path
@@ -15,6 +16,19 @@ for path in (ROOT, DYNAMICS_ROOT):
         sys.path.insert(0, str(path))
 
 from learned_dynamics.integration import reconstruct_next_state
+
+
+def load_script_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+RUN_CEM_MPC = load_script_module("local_run_cem_mpc_for_tests", ROOT / "scripts" / "run_cem_mpc.py")
+ANALYZE_OOD_MPC = load_script_module("local_analyze_ood_mpc_for_tests", ROOT / "scripts" / "analyze_ood_mpc.py")
 
 
 class IdentityNormalizer:
@@ -41,6 +55,31 @@ class ConstantDeltaDQModel(torch.nn.Module):
 
 
 class MPCPipelineTests(unittest.TestCase):
+    def test_runtime_outputs_resolve_to_top_level_outputs(self) -> None:
+        resolved = RUN_CEM_MPC.resolve_runtime_path("outputs/mpc/cem_run")
+
+        self.assertEqual(resolved, ROOT / "outputs" / "mpc" / "cem_run")
+
+    def test_runtime_legacy_dynamics_outputs_stay_addressable(self) -> None:
+        resolved = RUN_CEM_MPC.resolve_runtime_path(
+            "learned_mujoco_dynamics/outputs/checkpoints_transformer/transformer_20260606_154206/best_model.pt"
+        )
+
+        self.assertEqual(
+            resolved,
+            ROOT / "learned_mujoco_dynamics" / "outputs" / "checkpoints_transformer" / "transformer_20260606_154206" / "best_model.pt",
+        )
+
+    def test_runtime_bare_model_xml_resolves_to_dynamics_root(self) -> None:
+        resolved = RUN_CEM_MPC.resolve_runtime_path("ABB_IRB2400.xml")
+
+        self.assertEqual(resolved, DYNAMICS_ROOT / "ABB_IRB2400.xml")
+
+    def test_ood_outputs_resolve_to_top_level_outputs(self) -> None:
+        resolved = ANALYZE_OOD_MPC.resolve_runtime_path("outputs/mpc/ood_summary.csv")
+
+        self.assertEqual(resolved, ROOT / "outputs" / "mpc" / "ood_summary.csv")
+
     def test_delta_q_ref_is_converted_to_cumulative_absolute_actuator_targets(self) -> None:
         from mpc.planner_rollout import construct_actuator_q_ref_sequence
 

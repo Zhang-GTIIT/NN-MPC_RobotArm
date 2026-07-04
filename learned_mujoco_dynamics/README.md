@@ -1,12 +1,12 @@
-# Learned MuJoCo Dynamics 使用说明
+# Learned MuJoCo Dynamics 子模块使用说明
 
-这个项目用于在 MuJoCo 中采集机械臂运动数据，并用 PyTorch 训练神经网络动力学模型。当前阶段只做 dynamics learning，不做 MPC。
+这个目录是整个 `MPC_RL_RobotArm` 仓库中的 learned dynamics 子模块，用于在 MuJoCo 中采集机械臂运动数据，并用 PyTorch 训练神经网络动力学模型。顶层仓库还包含 CEM-MPC 闭环控制代码；完整目录说明见仓库根目录的 `PROJECT_STRUCTURE.md`。
 
 默认机械臂模型是项目根目录下的 `ABB_IRB2400.xml`。如果你要换成别的 MuJoCo XML/MJCF 模型，可以在命令中传入 `--model_xml path/to/robot.xml`。
 
 ## 1. 进入项目目录
 
-所有命令都应该从 `learned_mujoco_dynamics/` 目录运行：
+本 README 第 1-16 节中的 dynamics 数据采集、训练、open-loop 评估命令都应该从 `learned_mujoco_dynamics/` 目录运行：
 
 ```bash
 cd /home/xinlei/Data/RL_Projects/MPC_RL_RobotArm/learned_mujoco_dynamics
@@ -682,7 +682,7 @@ MPC_RL_RobotArm/
 └── tests/
 ```
 
-训练、数据采集、open-loop 评估仍从 `learned_mujoco_dynamics/` 目录运行；MPC 脚本从 Git 顶层运行。`learned_dynamics/` 仍只负责模型、normalizer、数据集和 learned rollout；CEM、cost、constraint、planner rollout 等控制逻辑都在顶层 `mpc/` 中。
+训练、dynamics 数据采集、open-loop 评估仍从 `learned_mujoco_dynamics/` 目录运行；MPC 脚本从 Git 顶层运行。`learned_dynamics/` 仍只负责模型、normalizer、数据集和 learned rollout；CEM、cost、constraint、planner rollout 等控制逻辑都在顶层 `mpc/` 中。MPC 闭环运行和 A/B/C 评估的新输出默认写入顶层 `outputs/mpc/`。
 
 命名约定很重要：
 
@@ -770,9 +770,9 @@ OOD 分析按每个模型自己的训练集统计，同时可选使用 Dataset A
 cd /home/xinlei/Data/RL_Projects/MPC_RL_RobotArm
 
 python scripts/analyze_ood_mpc.py \
-  --pair A,learned_mujoco_dynamics/outputs/mpc/model_abc/A/rollout.npz,learned_mujoco_dynamics/outputs/datasets/model_a.npz \
-  --pair B,learned_mujoco_dynamics/outputs/mpc/model_abc/B/rollout.npz,learned_mujoco_dynamics/outputs/datasets/model_b.npz \
-  --pair C,learned_mujoco_dynamics/outputs/mpc/model_abc/C/rollout.npz,learned_mujoco_dynamics/outputs/datasets/model_c.npz \
+  --pair A,outputs/mpc/model_abc/A/rollout.npz,learned_mujoco_dynamics/outputs/datasets/model_a.npz \
+  --pair B,outputs/mpc/model_abc/B/rollout.npz,learned_mujoco_dynamics/outputs/datasets/model_b.npz \
+  --pair C,outputs/mpc/model_abc/C/rollout.npz,learned_mujoco_dynamics/outputs/datasets/model_c.npz \
   --baseline_dataset learned_mujoco_dynamics/outputs/datasets/model_a.npz \
   --save_csv outputs/mpc/model_abc/ood_summary.csv
 ```
