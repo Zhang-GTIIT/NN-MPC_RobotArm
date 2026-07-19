@@ -22,11 +22,11 @@ cd /home/xinlei/Data/RL_Projects/NN-MPC_RobotArm
 python scripts/run_cem_mpc.py ...
 ```
 
-Use `dynamics_modeling/` for dynamics data collection, training, and open-loop learned dynamics evaluation:
+Run dynamics data collection, training, and open-loop learned-dynamics evaluation from the repository root as well:
 
 ```bash
-cd /home/xinlei/Data/RL_Projects/NN-MPC_RobotArm/dynamics_modeling
-python scripts/train_dynamics.py ...
+cd /home/xinlei/Data/RL_Projects/NN-MPC_RobotArm
+python dynamics_modeling/scripts/train_dynamics.py ...
 ```
 
 ## Dynamics Submodule
@@ -98,7 +98,7 @@ outputs/datasets/mpc_induced_data.npz
 outputs/references/circle_3laps/reference.npz
 ```
 
-Existing dynamics checkpoints and datasets can still be referenced explicitly under `dynamics_modeling/outputs/...`.
+Dynamics datasets, checkpoints, figures, and diagnostics are written explicitly under `dynamics_modeling/outputs/...`; this keeps them separate from top-level MPC outputs.
 
 This project map is maintained at `docs/PROJECT_STRUCTURE.md`.
 
@@ -106,10 +106,10 @@ This project map is maintained at `docs/PROJECT_STRUCTURE.md`.
 
 The repository now uses these path conventions:
 
-- Run dynamics scripts from `dynamics_modeling/`.
-- Run MPC scripts from the repository root.
+- Run both dynamics and MPC scripts from the repository root. Invoke dynamics entrypoints as `dynamics_modeling/scripts/<script>.py`.
 - New top-level MPC outputs use `outputs/...`.
 - Existing dynamics artifacts use `dynamics_modeling/outputs/...`.
+- Dynamics `--model_xml` paths are resolved by their scripts relative to `dynamics_modeling/`; dataset and output paths in root-level commands should explicitly start with `dynamics_modeling/outputs/...`.
 - A bare model XML path such as `ABB_IRB2400.xml` resolves to `dynamics_modeling/ABB_IRB2400.xml` in MPC scripts.
 - `--reference_mode task` requires a prevalidated `--reference_file`; it uses that file's `execution_steps` instead of `--episode_len`.
 
