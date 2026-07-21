@@ -43,25 +43,26 @@ class MuJoCoArmEnv:
                 "observation_noise_std must be finite and non-negative, "
                 f"got {observation_noise_std}"
             )
-        if observation_seed is not None and observation_seed < 0:
-            raise ValueError(f"observation_seed must be non-negative when provided, got {observation_seed}")
 
+        if observation_seed is not None and observation_seed < 0:
+            raise ValueError(
+                f"observation_seed must be non-negative when provided, got {observation_seed}"
+            )
         self.n_joints = int(n_joints)
         self.control_mode = control_mode
         self.gravity_compensation = bool(gravity_compensation)
         self.frame_skip = int(frame_skip)
-
-        # Keep environment randomization and observation noise on independent
-        # random streams. Extra observation reads therefore cannot change a
-        # later reset_random() result.
         self.rng = np.random.default_rng(seed)
         self.observation_noise_std = float(observation_noise_std)
+
         if observation_seed is None:
-            observation_seed_source: int | np.random.SeedSequence = np.random.SeedSequence(seed).spawn(1)[0]
+            observation_seed_source: int | np.random.SeedSequence = (
+                np.random.SeedSequence(seed).spawn(1)[0]
+            )
         else:
             observation_seed_source = observation_seed
-        self._observation_rng = np.random.default_rng(observation_seed_source)
 
+        self._observation_rng = np.random.default_rng(observation_seed_source)
         self.model = mujoco.MjModel.from_xml_path(str(self.model_xml))
         self.data = mujoco.MjData(self.model)
         self._gravity_data = mujoco.MjData(self.model) if self.gravity_compensation else None
@@ -115,31 +116,23 @@ class MuJoCoArmEnv:
         return kp.copy(), kd.copy()
 
     def get_state(self) -> np.ndarray:
-        """Return the deterministic MuJoCo truth state ``[q, dq]``."""
         qpos = np.asarray(self.data.qpos[: self.n_joints], dtype=np.float64)
         qvel = np.asarray(self.data.qvel[: self.n_joints], dtype=np.float64)
         return np.concatenate([qpos, qvel]).astype(np.float32)
-
-<<<<<<< Updated upstream
-=======
     def get_observation(self) -> np.ndarray:
-        """Return ``[q, dq]`` with optional zero-mean Gaussian sensor noise.
-
-        Noise is disabled by default. The truth-state API remains
-        :meth:`get_state`, which is deterministic and never advances the
-        observation random-number stream.
-        """
         state = self.get_state()
+
         if self.observation_noise_std == 0.0:
             return state
-        noise = self._observation_rng.normal(
-            loc=0.0,
-            scale=self.observation_noise_std,
-            size=state.shape,
-        )
-        return (state.astype(np.float64) + noise).astype(np.float32)
 
->>>>>>> Stashed changes
+        noise = self._observation_rng.normal(
+          loc=0.0,
+          scale=self.observation_noise_std,
+          size=state.shape,
+         )
+
+        return (state.astype(np.float64) + noise).astype(np.float32)
+    
     def validate_joint_positions(self, context: str = "step") -> None:
         qpos = np.asarray(self.data.qpos[: self.n_joints], dtype=np.float64)
         low = np.asarray(self.joint_low, dtype=np.float64) - self._JOINT_LIMIT_TOLERANCE
