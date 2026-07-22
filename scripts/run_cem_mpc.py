@@ -159,6 +159,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="mpc",
         help="mpc uses learned CEM-MPC; ik_direct sends the validated task-space IK q_des directly to position actuators.",
     )
+    parser.add_argument(
+        "--ik_preview_steps",
+        default=0,
+        type=int,
+        help="Fixed task-reference preview for Direct/Preview IK; calibrated once and frozen across test trajectories.",
+    )
 
     parser.add_argument("--horizon", default=20, type=int)
     parser.add_argument(
@@ -178,6 +184,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=6,
         type=int,
         help="Expected planner-to-activation delay in 100 Hz steps. The default 6-step delay matches the measured GRU planning latency.",
+    )
+    parser.add_argument(
+        "--delay_protocol",
+        choices=["full", "naive_delayed", "no_future_alignment", "no_reanchor", "no_feedback"],
+        default="full",
+        help="Canonical fixed-delay causal variant. Threaded deployment only supports full.",
     )
     parser.add_argument("--planner_guard_ms", default=5.0, type=float, help="threaded_asap drops a packet published within this many ms of its activation deadline.")
     parser.add_argument("--planner_min_interval_ms", default=0.0, type=float, help="Minimum delay between threaded planner launches; zero means strict ASAP.")
@@ -432,7 +444,7 @@ def _load_task_reference(args: argparse.Namespace) -> ReferenceBundle:
     # Virtual delay-aware execution shortens the executable prefix near the
     # end of a reference, rather than requiring a separately padded file.
     # The runner applies that prefix truncation before issuing a future plan.
-    future_steps = args.horizon if args.controller_mode == "mpc" else 0
+    future_steps = args.horizon if args.controller_mode == "mpc" else int(args.ik_preview_steps)
     if args.controller_mode == "mpc" and args.multirate_mode in {"virtual_asap", "virtual_smooth"}:
         future_steps += int(args.anticipation_delay_steps)
     bundle = load_reference_bundle(
@@ -535,6 +547,12 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
         setattr(args, "activation_observer", activation_observer)
     if args.controller_mode == "ik_direct" and args.reference_mode != "task":
         raise ValueError("--controller_mode ik_direct requires --reference_mode task with a validated IK reference")
+    if args.ik_preview_steps < 0:
+        raise ValueError("--ik_preview_steps must be non-negative")
+    if args.controller_mode != "ik_direct" and args.ik_preview_steps:
+        raise ValueError("--ik_preview_steps is only valid with --controller_mode ik_direct")
+    if args.anticipation_delay_steps < 0:
+        raise ValueError("--anticipation_delay_steps must be non-negative")
     if args.reference_mode != "task" and args.episode_len <= 0:
         raise ValueError(f"episode_len must be positive, got {args.episode_len}")
     if args.controller_mode == "mpc" and args.horizon <= 0:
@@ -573,6 +591,8 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
         if args.multirate_mode != "virtual_asap":
             raise ValueError("mujoco_oracle is an offline upper bound and only supports --multirate_mode virtual_asap")
     if args.multirate_mode == "threaded_asap":
+        if args.delay_protocol != "full":
+            raise ValueError("threaded_asap only supports --delay_protocol full")
         return run_threaded_asap(args, globals())
     if args.multirate_mode != "synchronous":
         return run_delay_aware_virtual(args, globals())
@@ -1020,7 +1040,9 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
                         command_buffer_plan_length = buffer_length
                         delta_q_ref = q_ref_command - previous_q_ref
             else:
-                q_ref_command = np.asarray(reference[step_idx + 1], dtype=np.float32).copy()
+                q_ref_command = np.asarray(
+                    reference[step_idx + 1 + int(args.ik_preview_steps)], dtype=np.float32
+                ).copy()
                 delta_q_ref = q_ref_command - previous_q_ref
                 planning_time = 0.0
                 replan_time = float("nan")
@@ -1255,6 +1277,9 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
 
     arrays: dict[str, np.ndarray] = {
         "controller_mode": np.asarray(args.controller_mode),
+        "ik_preview_steps": np.asarray(args.ik_preview_steps, dtype=np.int64),
+        "delay_protocol": np.asarray(args.delay_protocol),
+        "anticipation_delay_steps": np.asarray(args.anticipation_delay_steps, dtype=np.int64),
         "actual_states": _stack_records(actual_states),
         "observed_states": _stack_records(observed_states),
         "observation_noise": _stack_records(observation_noise),

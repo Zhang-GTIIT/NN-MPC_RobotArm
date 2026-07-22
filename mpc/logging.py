@@ -236,6 +236,15 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
             "feedback_p95_abs_rad": _per_joint_percentile(
                 np.asarray(arrays.get("feedback_correction", np.empty((0,)))), 95.0
             ),
+            "projection_discrepancy_p95_abs_rad": _per_joint_percentile(
+                np.asarray(arrays.get("projection_discrepancy", np.empty((0,)))), 95.0
+            ),
+            "projection_activation_rate": float(np.mean(np.asarray(arrays.get("projection_active", np.empty(0))) != 0))
+            if np.asarray(arrays.get("projection_active", np.empty(0))).size else float("nan"),
+            "residual_saturation_rate": float(np.mean(np.asarray(arrays.get("residual_saturated", np.empty(0))) != 0))
+            if np.asarray(arrays.get("residual_saturated", np.empty(0))).size else float("nan"),
+            "feedback_saturation_rate": float(np.mean(np.asarray(arrays.get("feedback_saturated", np.empty(0))) != 0))
+            if np.asarray(arrays.get("feedback_saturated", np.empty(0))).size else float("nan"),
             "packet_events": _string_counts(np.asarray(arrays.get("packet_event", np.empty(0)))),
         },
         "model_replay": _replay_summary(arrays),

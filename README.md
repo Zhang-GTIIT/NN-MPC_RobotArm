@@ -144,5 +144,6 @@ conda run -n pendulum-rl python -m unittest mpc/test_residual_mpc.py -v
 - [Cost function](docs/CostFunction.md)
 - [MPC 伪代码](docs/mpc-pseudocode.md)
 - [运行命令](docs/run_command.md)
+- [Delay-Aware MPC 论文实验操作手册](docs/PAPER_DELAY_AWARE_EXPERIMENTS.md)
 - [项目结构](docs/PROJECT_STRUCTURE.md)
 - [完成状态（历史快照）](docs/PROJECT_COMPLETION_STATUS.md)

@@ -69,6 +69,7 @@ class ReferenceConfig:
     figure8_axis_a: float = 0.035
     figure8_axis_b: float = 0.02
     square_half_side: float = 0.025
+    rounded_square_corner_radius: float = 0.006
 
     safe_departure_mode: str = "auto"
     safe_sigma_threshold: float = 0.10
@@ -89,7 +90,7 @@ class ReferenceConfig:
     max_joint_acceleration: tuple[float, ...] = (5.0, 5.0, 5.0, 10.0, 10.0, 12.5)
 
     def __post_init__(self) -> None:
-        if self.shape_name.lower() not in {"circle", "ellipse", "figure8", "square"}:
+        if self.shape_name.lower() not in {"circle", "ellipse", "figure8", "square", "rounded_square"}:
             raise ValueError(f"Unsupported shape_name {self.shape_name!r}")
         if not isinstance(self.repeat_count, int) or self.repeat_count <= 0:
             raise ValueError("repeat_count must be a positive integer")
@@ -470,6 +471,7 @@ def build_reference(
         figure8_axis_a=config.figure8_axis_a,
         figure8_axis_b=config.figure8_axis_b,
         square_half_side=config.square_half_side,
+        rounded_square_corner_radius=config.rounded_square_corner_radius,
         include_return=not config.collection_only,
     )
 

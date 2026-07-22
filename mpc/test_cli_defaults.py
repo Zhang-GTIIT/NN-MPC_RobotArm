@@ -27,7 +27,10 @@ SWEEP = load_module("cli_defaults_sweep", ROOT / "scripts" / "run_cem_budget_swe
 
 class ThreadedASAPDefaultTests(unittest.TestCase):
     def test_runner_defaults_to_threaded_asap(self) -> None:
-        self.assertEqual(RUNNER.parse_args([]).multirate_mode, "threaded_asap")
+        args = RUNNER.parse_args([])
+        self.assertEqual(args.multirate_mode, "threaded_asap")
+        self.assertEqual(args.delay_protocol, "full")
+        self.assertEqual(args.ik_preview_steps, 0)
 
     def test_budget_sweep_defaults_to_and_accepts_threaded_asap(self) -> None:
         with mock.patch.object(sys, "argv", ["run_cem_budget_sweep.py"]):

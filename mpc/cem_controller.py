@@ -60,6 +60,7 @@ class CEMMPCResult:
     failure: bool
     failure_reason: str
     best_sequence: np.ndarray
+    selected_action_sequence: np.ndarray
     selected_q_ref_sequence: np.ndarray
     selected_residual_sequence: np.ndarray
     cost_terms: dict[str, float]
@@ -199,6 +200,7 @@ class CEMMPCController:
             failure=True,
             failure_reason=reason,
             best_sequence=np.zeros((self.config.horizon, self.config.action_dim), dtype=np.float32),
+            selected_action_sequence=np.zeros((self.config.horizon, self.config.action_dim), dtype=np.float32),
             selected_q_ref_sequence=np.repeat(previous[None, :], self.config.horizon, axis=0),
             selected_residual_sequence=np.zeros((self.config.horizon, self.config.action_dim), dtype=np.float32),
             cost_terms={},
@@ -494,6 +496,7 @@ class CEMMPCController:
             failure=False,
             failure_reason="",
             best_sequence=best_sequence.detach().cpu().numpy().astype(np.float32),
+            selected_action_sequence=selected_raw_sequence.detach().cpu().numpy().astype(np.float32),
             selected_q_ref_sequence=selected_q_ref_sequence.detach().cpu().numpy().astype(np.float32),
             selected_residual_sequence=selected_residual_sequence.detach().cpu().numpy().astype(np.float32),
             cost_terms=selected_cost_terms,

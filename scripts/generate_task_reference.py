@@ -40,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model_xml", default="dynamics_modeling/ABB_IRB2400.xml")
     parser.add_argument("--save_dir", required=True)
-    parser.add_argument("--shape", choices=["circle", "ellipse", "figure8", "square"], default="circle")
+    parser.add_argument("--shape", choices=["circle", "ellipse", "figure8", "square", "rounded_square"], default="circle")
     parser.add_argument("--repeat_count", type=int, default=3)
     parser.add_argument("--control_dt", type=float, default=0.01)
     parser.add_argument("--horizon", type=int, default=20)
@@ -68,6 +68,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--figure8_axis_a", type=float, default=0.035)
     parser.add_argument("--figure8_axis_b", type=float, default=0.02)
     parser.add_argument("--square_half_side", type=float, default=0.025)
+    parser.add_argument("--rounded_square_corner_radius", type=float, default=0.006)
 
     parser.add_argument("--safe_departure_mode", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--safe_sigma_threshold", type=float, default=0.10)
@@ -127,6 +128,7 @@ def _reference_config_from_args(args: argparse.Namespace) -> ReferenceConfig:
         figure8_axis_a=args.figure8_axis_a,
         figure8_axis_b=args.figure8_axis_b,
         square_half_side=args.square_half_side,
+        rounded_square_corner_radius=args.rounded_square_corner_radius,
         safe_departure_mode=args.safe_departure_mode,
         safe_sigma_threshold=args.safe_sigma_threshold,
         safe_search_samples=args.safe_search_samples,

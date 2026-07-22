@@ -3,20 +3,18 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
+from scripts.experiment_utils.hashing import canonical_sha256, file_identity as common_file_identity, sha256_file
+from scripts.experiment_utils.resume import load_completed_rollout as common_load_completed_rollout
+
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for block in iter(lambda: file.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def write_summary(path: Path, rows: list[dict[str, float | str | int]]) -> None:
@@ -148,7 +146,7 @@ def file_identity(value: object, resolve_path: Callable[[str], Path]) -> dict[st
     path = resolve_path(text)
     if not path.is_file():
         return {"path": str(path), "exists": False}
-    return {"path": str(path.resolve()), "size": path.stat().st_size, "sha256": sha256(path)}
+    return common_file_identity(path)
 
 
 def build_fingerprint(case_id: str, case: dict[str, object], controller: dict[str, object], run_args: argparse.Namespace, runner: Any) -> dict[str, object]:
@@ -161,18 +159,8 @@ def build_fingerprint(case_id: str, case: dict[str, object], controller: dict[st
                "reference": file_identity(config.get("reference_file"), runner.resolve_runtime_path),
                "nominal_model": file_identity(robustness.nominal_model_xml, runner.resolve_runtime_path),
                "plant_model": file_identity(robustness.plant_model_xml, runner.resolve_runtime_path)}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    return {"sha256": hashlib.sha256(canonical).hexdigest(), "payload": payload}
+    return {"sha256": canonical_sha256(payload), "payload": payload}
 
 
 def load_completed_rollout(run_dir: Path, expected: dict[str, object]) -> dict[str, np.ndarray] | None:
-    rollout, fingerprint = run_dir / "rollout.npz", run_dir / "run_fingerprint.json"
-    if not rollout.exists() and not fingerprint.exists():
-        return None
-    if not rollout.exists() or not fingerprint.exists():
-        raise RuntimeError(f"Incomplete resumable output at {run_dir}; move it aside or rerun without --resume")
-    actual = json.loads(fingerprint.read_text(encoding="utf-8"))
-    if actual.get("sha256") != expected.get("sha256"):
-        raise RuntimeError(f"Resume fingerprint mismatch at {run_dir}; refusing to reuse a different experiment")
-    with np.load(rollout, allow_pickle=False) as archive:
-        return {key: np.asarray(archive[key]) for key in archive.files}
+    return common_load_completed_rollout(run_dir, expected)

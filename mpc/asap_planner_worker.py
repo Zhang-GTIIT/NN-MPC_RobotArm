@@ -168,7 +168,7 @@ class ASAPPlannerWorker(threading.Thread):
             calibration = self.api["_reference_calibration"](self.reference, self.dq_reference, self.ddq_reference, velocity_limit, acceleration_limit)
             t = lambda value: torch.as_tensor(value, dtype=torch.float32, device=device)
             cost = JointSpaceCostConfig(cost_mode="residual", w_q=self.args.w_q, w_dq=self.args.w_dq, w_residual=self.args.w_residual, w_servo=self.args.w_servo, w_residual_velocity=self.args.w_residual_velocity, w_residual_acceleration=self.args.w_residual_acceleration, w_first=self.args.w_first, w_qref_velocity=self.args.w_qref_velocity, w_qref_acceleration=self.args.w_qref_acceleration, w_terminal=self.args.w_terminal, w_joint_limit=self.args.w_joint_limit, w_dq_limit=self.args.w_dq_limit, q_tracking_scale=t(calibration["q_tracking_scale"]), dq_tracking_scale=t(calibration["dq_tracking_scale"]), residual_scale=t(0.5 * residual_max), servo_scale=t(parse(self.args.servo_scale, self.args.n_joints, "servo_scale")), residual_velocity_scale=t(residual_max / bundle.control_dt), residual_acceleration_scale=t(residual_max / bundle.control_dt**2), qref_velocity_scale=t(velocity_limit), qref_acceleration_scale=t(acceleration_limit), temporal_discount=self.args.temporal_discount, barrier_max_weight=self.args.barrier_max_weight, state_velocity_limit=t(parse(self.args.state_velocity_limit, self.args.n_joints, "state_velocity_limit")), joint_limit_safe_margin=self.args.joint_limit_safe_margin, joint_limit_temp=self.args.joint_limit_temp, dq_limit_temp=self.args.dq_limit_temp, control_dt=bundle.control_dt, velocity_cost_mode=self.args.velocity_cost_mode)
-            rollout = PlannerRolloutConfig(mpc_policy="residual", q_ref_velocity_limit=t(velocity_limit), q_ref_acceleration_limit=t(acceleration_limit), residual_max=t(residual_max), joint_limit_margin=self.args.joint_limit_margin, rollout_batch_size=self.args.rollout_batch_size, project_residual_kinematics=False)
+            rollout = PlannerRolloutConfig(mpc_policy="residual", q_ref_velocity_limit=t(velocity_limit), q_ref_acceleration_limit=t(acceleration_limit), residual_max=t(residual_max), joint_limit_margin=self.args.joint_limit_margin, rollout_batch_size=self.args.rollout_batch_size, project_residual_kinematics=True)
             controller: CEMMPCController | None = None
             last_request = -1
             mean_anchor_step: int | None = None
@@ -239,7 +239,18 @@ class ASAPPlannerWorker(threading.Thread):
                     self.late_drop_count += int(late_dropped)
                 if result.failure or late_dropped:
                     continue
-                packet = ASAPPlanPacket(plan_id=plan_id, launch_step=snapshot.launch_step, launch_time_ns=snapshot.launch_time_ns, activation_step=anchor, activation_time_ns=activation_ns, publish_time_ns=publish_ns, residual_sequence=result.selected_residual_sequence.copy(), predicted_state_sequence=result.selected_predicted_state_sequence.copy(), planning_time_s=float(result.planning_time), anchor_state=anchor_state.copy(), selection_mode=result.selection_mode, selected_cost=float(result.selected_cost))
+                packet = ASAPPlanPacket(
+                    plan_id=plan_id, launch_step=snapshot.launch_step, launch_time_ns=snapshot.launch_time_ns,
+                    activation_step=anchor, activation_time_ns=activation_ns, publish_time_ns=publish_ns,
+                    residual_sequence=result.selected_residual_sequence.copy(),
+                    predicted_state_sequence=result.selected_predicted_state_sequence.copy(),
+                    planning_time_s=float(result.planning_time), anchor_state=anchor_state.copy(),
+                    selection_mode=result.selection_mode, selected_cost=float(result.selected_cost),
+                    q_ref_sequence=result.selected_q_ref_sequence.copy(),
+                    requested_residual_sequence=(
+                        np.clip(result.selected_action_sequence, -1.0, 1.0) * residual_max[None, :]
+                    ).astype(np.float32),
+                )
                 plan_id += 1
                 self.packets.publish(packet)
         except Exception as exc:  # never strand the control thread during shutdown

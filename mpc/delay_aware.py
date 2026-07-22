@@ -7,7 +7,7 @@ is important when a delayed plan expires or the planner fails.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -26,6 +26,8 @@ class DelayedPlanPacket:
     planning_time_s: float
     mode: str
     branch_candidates: tuple[object, ...] = ()
+    q_ref_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
+    requested_residual_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
 
     @property
     def horizon(self) -> int:

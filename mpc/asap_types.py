@@ -1,7 +1,7 @@
 """Immutable values exchanged by the real-time ASAP-MPC threads."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -20,6 +20,8 @@ class ASAPPlanPacket:
     anchor_state: np.ndarray
     selection_mode: str
     selected_cost: float
+    q_ref_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
+    requested_residual_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
 
     @property
     def horizon(self) -> int:

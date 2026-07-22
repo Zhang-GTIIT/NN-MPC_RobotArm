@@ -16,6 +16,8 @@ def _copy_packet(packet: ASAPPlanPacket) -> ASAPPlanPacket:
         publish_time_ns=packet.publish_time_ns, residual_sequence=packet.residual_sequence.copy(),
         predicted_state_sequence=packet.predicted_state_sequence.copy(), planning_time_s=packet.planning_time_s,
         anchor_state=packet.anchor_state.copy(), selection_mode=packet.selection_mode, selected_cost=packet.selected_cost,
+        q_ref_sequence=packet.q_ref_sequence.copy(),
+        requested_residual_sequence=packet.requested_residual_sequence.copy(),
     )
 
 

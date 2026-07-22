@@ -202,7 +202,15 @@ def write_metric_rows(path: Path, fieldnames: list[str], rows: list[dict[str, fl
         writer.writerows(rows)
 
 
-def summarize_prediction(truth: np.ndarray, pred: np.ndarray, labels: list[str]) -> dict[str, float]:
+def summarize_prediction(
+    truth: np.ndarray,
+    pred: np.ndarray,
+    labels: list[str],
+    *,
+    joint_low: np.ndarray | None = None,
+    joint_high: np.ndarray | None = None,
+    velocity_limit: float = 25.0,
+) -> dict[str, float]:
     errors = truth - pred
     n_joints = truth.shape[1] // 2
     row: dict[str, float] = {
@@ -211,6 +219,14 @@ def summarize_prediction(truth: np.ndarray, pred: np.ndarray, labels: list[str])
         "q_rmse": float(np.sqrt(np.mean(np.square(errors[:, :n_joints])))),
         "dq_rmse": float(np.sqrt(np.mean(np.square(errors[:, n_joints:])))),
     }
+    invalid = ~np.all(np.isfinite(pred), axis=1)
+    if joint_low is not None and joint_high is not None:
+        low = np.asarray(joint_low, dtype=np.float64).reshape(1, -1)
+        high = np.asarray(joint_high, dtype=np.float64).reshape(1, -1)
+        invalid |= np.any(pred[:, :n_joints] < low - 0.05, axis=1)
+        invalid |= np.any(pred[:, :n_joints] > high + 0.05, axis=1)
+    invalid |= np.any(np.abs(pred[:, n_joints:]) > float(velocity_limit), axis=1)
+    row["divergence_rate"] = float(np.mean(invalid))
     rmse = per_dimension_rmse(truth, pred)
     mse = np.mean(np.square(errors), axis=0)
     truth_var = np.var(truth, axis=0)
@@ -429,6 +445,12 @@ def main() -> None:
                 mode_id=rollout_idx,
             )
             true_states = true_states_all[args.warmup_steps : args.warmup_steps + args.rollout_len]
+            np.savez_compressed(
+                save_dir / f"evaluation_rollout_{rollout_idx:03d}.npz",
+                true_states=true_states_all,
+                actions=actions,
+                true_next_states=true_next_states_all,
+            )
             torque_components = {
                 key: value[args.warmup_steps : args.warmup_steps + args.rollout_len]
                 for key, value in torque_all.items()
@@ -482,7 +504,10 @@ def main() -> None:
                         "horizon": horizon,
                         "action_std": args.action_std,
                         "warmup_steps": args.warmup_steps,
-                        **summarize_prediction(horizon_truth, horizon_pred, labels),
+                        **summarize_prediction(
+                            horizon_truth, horizon_pred, labels,
+                            joint_low=env.joint_low, joint_high=env.joint_high,
+                        ),
                     }
                 )
 
@@ -517,7 +542,10 @@ def main() -> None:
                         "horizon": 1,
                         "action_std": args.action_std,
                         "warmup_steps": args.warmup_steps,
-                        **summarize_prediction(true_next_states_all, teacher_pred_next, labels),
+                        **summarize_prediction(
+                            true_next_states_all, teacher_pred_next, labels,
+                            joint_low=env.joint_low, joint_high=env.joint_high,
+                        ),
                     }
                 )
     finally:
@@ -533,6 +561,7 @@ def main() -> None:
         "max_l2",
         "q_rmse",
         "dq_rmse",
+        "divergence_rate",
         *[f"{label}_rmse" for label in labels],
         *[f"{label}_nmse" for label in labels],
         *[f"{label}_r2" for label in labels],

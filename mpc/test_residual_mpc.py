@@ -279,6 +279,8 @@ class CEMBaselineTests(unittest.TestCase):
         self.assertEqual(result.selected_q_ref_sequence.shape, (3, 1))
         self.assertEqual(result.selected_residual_sequence.shape, (3, 1))
         self.assertEqual(result.selected_predicted_state_sequence.shape, (4, 2))
+        self.assertEqual(result.selected_action_sequence.shape, (3, 1))
+        np.testing.assert_allclose(result.selected_action_sequence, 0.0)
         np.testing.assert_allclose(result.selected_residual_sequence, 0.0)
         np.testing.assert_allclose(result.q_ref, result.selected_q_ref_sequence[0])
         controller.mean = torch.tensor([[1.0], [2.0], [3.0]])
