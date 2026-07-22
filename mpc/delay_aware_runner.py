@@ -44,7 +44,8 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
             checkpoint_path=api["resolve_runtime_path"](args.checkpoint), normalizer_path=api["resolve_runtime_path"](args.normalizer),
             model_type=args.model_type, n_joints=args.n_joints, device=device, history_len=args.history_len,
         )
-    env = api["MuJoCoArmEnv"](str(api["resolve_runtime_path"](args.model_xml)), n_joints=args.n_joints, seed=args.seed)
+    robustness = api["_robustness_config"](args)
+    env = api["_build_control_env"](args)
     oracle_env = (
         api["MuJoCoArmEnv"](str(api["resolve_runtime_path"](args.model_xml)), n_joints=args.n_joints, seed=args.seed)
         if dynamics_backend == "mujoco_oracle"
@@ -56,14 +57,15 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("activation_observer data collection requires learned dynamics, not mujoco_oracle")
     stack = api["_stack_records"]
     try:
-        state = env.reset_to_configuration(api["MPC_HOME_Q"][: args.n_joints])
-        previous_command = np.asarray(state[: args.n_joints], dtype=np.float32).copy()
+        true_state = env.reset_to_configuration(api["MPC_HOME_Q"][: args.n_joints])
+        previous_command = np.asarray(true_state[: args.n_joints], dtype=np.float32).copy()
         previous_velocity = np.zeros(args.n_joints, dtype=np.float32)
         for _ in range(args.settle_steps):
-            state = env.step(previous_command)
+            true_state = env.step(previous_command)
+        state = env.get_observation()
         states_history, command_history = [state.copy()], [previous_command.copy()]
         reference, dq_reference, ddq_reference, execution_steps, task_reference = api["_reference_for_run"](
-            args=args, state=state, env=env, control_dt=control_dt
+            args=args, state=true_state, env=env, control_dt=control_dt
         )
         if args.max_execution_steps is not None:
             execution_steps = min(execution_steps, args.max_execution_steps)
@@ -100,7 +102,7 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
         active: DelayedPlanPacket | None = None
         pending: dict[int, DelayedPlanPacket] = {}
         rec: dict[str, list[Any]] = {key: [] for key in (
-            "actual_states next_states q_des dq_des actuator_q_ref delta_q_ref command_velocity command_acceleration planning_time replan_time mpc_replanned replan_deadline_miss control_step_wall_time buffer_index buffer_length best_cost mean_cost baseline_cost selected_cost elite_mean_cost selection_mode failure_flags joint_limit_violation_flags command_velocity_violation_flags command_acceleration_violation_flags realized_tracking_error nominal_q_ref buffered_residual executed_residual feedback_correction predicted_feedback_state packet_age packet_event tau_actuator tau_gravity tau_total desired_ee_positions desired_ee_rotations actual_ee_positions actual_ee_rotations ee_position_errors ee_orientation_errors segment_ids lap_ids".split()
+            "actual_states observed_states observation_noise next_states q_des dq_des actuator_q_ref delta_q_ref command_velocity command_acceleration planning_time replan_time mpc_replanned replan_deadline_miss control_step_wall_time buffer_index buffer_length best_cost mean_cost baseline_cost selected_cost elite_mean_cost selection_mode failure_flags joint_limit_violation_flags command_velocity_violation_flags command_acceleration_violation_flags realized_tracking_error nominal_q_ref buffered_residual executed_residual feedback_correction predicted_feedback_state packet_age packet_event tau_actuator tau_gravity tau_total tau_gravity_true tau_gravity_mismatch external_force_world external_generalized_force desired_ee_positions desired_ee_rotations actual_ee_positions actual_ee_rotations ee_position_errors ee_orientation_errors segment_ids lap_ids".split()
         )}
         rows: list[dict[str, Any]] = []
 
@@ -152,7 +154,7 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                     activation_observer(
                         step=step,
                         env=env,
-                        state=state.copy(),
+                        state=true_state.copy(),
                         previous_command=previous_command.copy(),
                         previous_velocity=previous_velocity.copy(),
                         states_history=np.asarray(states_history, dtype=np.float32),
@@ -252,20 +254,22 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
             delta = command - previous_command
             velocity, acceleration = delta / control_dt, (delta / control_dt - previous_velocity) / control_dt
             torque = env.compute_torque_components(command)
-            rec["actual_states"].append(state.copy()); rec["q_des"].append(reference[step].copy()); rec["dq_des"].append(dq_reference[step].copy())
+            rec["actual_states"].append(true_state.copy()); rec["observed_states"].append(state.copy()); rec["observation_noise"].append((state - true_state).astype(np.float32)); rec["q_des"].append(reference[step].copy()); rec["dq_des"].append(dq_reference[step].copy())
             if task_reference is not None:
                 dp, dr = np.asarray(task_reference.task_positions_des[step], dtype=np.float32), np.asarray(task_reference.task_rotations_des[step], dtype=np.float32)
                 ap, ar = api["site_pose"](env.model, env.data, args.ee_site_name); ap, ar = np.asarray(ap, dtype=np.float32), np.asarray(ar, dtype=np.float32)
                 rec["desired_ee_positions"].append(dp); rec["desired_ee_rotations"].append(dr); rec["actual_ee_positions"].append(ap); rec["actual_ee_rotations"].append(ar)
                 rec["ee_position_errors"].append(float(np.linalg.norm(ap - dp))); rec["ee_orientation_errors"].append(api["_orientation_error"](dr, ar)); rec["segment_ids"].append(int(task_reference.segment_ids[step])); rec["lap_ids"].append(int(task_reference.lap_ids[step]))
-            state = env.step(command)
-            rec["next_states"].append(state.copy()); rec["actuator_q_ref"].append(command); rec["delta_q_ref"].append(delta); rec["command_velocity"].append(velocity); rec["command_acceleration"].append(acceleration)
+            external_force = api["_force_for_step"](robustness, step, execution_steps)
+            true_state = env.step(command, external_force_world=external_force)
+            state = env.get_observation()
+            rec["next_states"].append(true_state.copy()); rec["external_force_world"].append(env.last_external_force_world.astype(np.float32).copy()); rec["external_generalized_force"].append(env.last_external_generalized_force.astype(np.float32).copy()); rec["actuator_q_ref"].append(command); rec["delta_q_ref"].append(delta); rec["command_velocity"].append(velocity); rec["command_acceleration"].append(acceleration)
             rec["planning_time"].append(0.0 if not np.isfinite(planning_time) else planning_time); rec["replan_time"].append(planning_time); rec["mpc_replanned"].append(replanned); rec["replan_deadline_miss"].append(int(np.isfinite(planning_time) and planning_time > delay * control_dt)); rec["control_step_wall_time"].append(api["time"].perf_counter() - started)
             rec["buffer_index"].append(age); rec["buffer_length"].append(args.horizon if active is not None else 0); rec["best_cost"].append(best); rec["mean_cost"].append(mean); rec["baseline_cost"].append(baseline); rec["selected_cost"].append(selected); rec["elite_mean_cost"].append(elite); rec["selection_mode"].append(selection); rec["failure_flags"].append(failure); rec["joint_limit_violation_flags"].append(0); rec["command_velocity_violation_flags"].append(int(np.any(np.abs(velocity) > physical_v + 1e-6))); rec["command_acceleration_violation_flags"].append(int(np.any(np.abs(acceleration) > physical_a + 1e-6)))
             rec["nominal_q_ref"].append(nominal); rec["buffered_residual"].append(plan_residual); rec["executed_residual"].append(executed); rec["feedback_correction"].append(feedback); rec["predicted_feedback_state"].append(predicted_feedback); rec["packet_age"].append(age); rec["packet_event"].append(event)
-            for source, target in (("actuator_tau", "tau_actuator"), ("gravity_tau", "tau_gravity"), ("total_tau", "tau_total")):
+            for source, target in (("actuator_tau", "tau_actuator"), ("gravity_tau", "tau_gravity"), ("total_tau", "tau_total"), ("true_gravity_tau", "tau_gravity_true"), ("gravity_mismatch_tau", "tau_gravity_mismatch")):
                 rec[target].append(torque[source].astype(np.float32))
-            tracking = float(np.linalg.norm(state[: args.n_joints] - reference[step + 1])); rec["realized_tracking_error"].append(tracking)
+            tracking = float(np.linalg.norm(true_state[: args.n_joints] - reference[step + 1])); rec["realized_tracking_error"].append(tracking)
             rows.append({"step": step, "controller_mode": "mpc", "tracking_error": tracking, "planning_time": planning_time, "replan_time": planning_time, "mpc_replanned": replanned, "replan_deadline_miss": rec["replan_deadline_miss"][-1], "multirate_mode": args.multirate_mode, "packet_event": event, "packet_age": age, "feedback_correction_norm": float(np.linalg.norm(feedback)), "executed_residual_norm": float(np.linalg.norm(executed)), "selection_mode": selection})
             previous_command, previous_velocity = command.copy(), velocity.astype(np.float32)
             commit_command_and_append_placeholder(states_history, command_history, command, state)
@@ -291,7 +295,11 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
         "cem_num_samples": np.asarray(args.num_samples, dtype=np.int64), "cem_iters": np.asarray(args.cem_iters, dtype=np.int64),
         "cem_horizon": np.asarray(args.horizon, dtype=np.int64), "cem_seed": np.asarray(args.seed, dtype=np.int64),
         "ddq_des": stack([ddq_reference[i] for i in range(len(rec["q_des"]))]),
+        **api["config_arrays"](robustness, env),
     })
+    pulse_start, pulse_stop = robustness.pulse_window(execution_steps)
+    arrays["force_pulse_start_step"] = np.asarray(pulse_start, dtype=np.int64)
+    arrays["force_pulse_stop_step"] = np.asarray(pulse_stop, dtype=np.int64)
     arrays["oracle_wall_time_deadline_miss"] = (
         arrays["replan_deadline_miss"].copy()
         if dynamics_backend == "mujoco_oracle"

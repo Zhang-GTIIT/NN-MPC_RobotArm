@@ -32,6 +32,7 @@ from mpc.reference import finite_difference_dq, generate_joint_reference
 from mpc.reference_pipeline import ReferenceBundle, load_reference_bundle
 from mpc.recovery import residual_recovery_reason
 from mpc.replay_diagnostics import replay_executed_commands
+from mpc.robustness import RobustnessConfig, config_arrays, resolve_robustness_config
 from mpc.utils import build_history_tensor
 from mpc.history import commit_command_and_append_placeholder
 
@@ -78,12 +79,39 @@ def resolve_runtime_path(path: str) -> Path:
     return root_path
 
 
+def _robustness_config(args: argparse.Namespace) -> RobustnessConfig:
+    return resolve_robustness_config(args, resolve_runtime_path)
+
+
+def _build_control_env(args: argparse.Namespace, *, seed: int | None = None) -> MuJoCoArmEnv:
+    config = _robustness_config(args)
+    environment_seed = args.seed if seed is None else seed
+    return MuJoCoArmEnv(
+        str(config.plant_model_xml), n_joints=args.n_joints, seed=environment_seed,
+        gravity_compensation_model_xml=str(config.nominal_model_xml),
+        actuator_kp_scale=config.actuator_kp_scale,
+        actuator_kd_scale=config.actuator_kd_scale,
+        observation_q_noise_std=config.observation_q_std_rad,
+        observation_dq_noise_std=config.observation_dq_std_rad_s,
+        observation_seed=environment_seed + 104729,
+    )
+
+
+def _force_for_step(config: RobustnessConfig, step: int, execution_steps: int) -> np.ndarray:
+    start, stop = config.pulse_window(execution_steps)
+    return config.force_world() if start <= step < stop else np.zeros(3, dtype=np.float32)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run learned CEM-MPC in closed-loop MuJoCo simulation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model_xml", default=DEFAULT_MODEL_XML, type=str)
+    parser.add_argument("--payload_level", choices=range(7), default=0, type=int)
+    parser.add_argument("--actuator_gain_level", choices=range(7), default=0, type=int)
+    parser.add_argument("--force_pulse_level", choices=range(7), default=0, type=int)
+    parser.add_argument("--observation_noise_level", choices=range(7), default=0, type=int)
     parser.add_argument("--checkpoint", default=None, type=str, help="Dynamics checkpoint. Required for --controller_mode mpc.")
     parser.add_argument("--normalizer", default=None, type=str, help="Dynamics normalizer. Required for --controller_mode mpc.")
     parser.add_argument("--model_type", choices=["mlp", "gru", "transformer"], default="transformer")
@@ -536,6 +564,9 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
     if args.planner_guard_ms < 0.0 or args.planner_min_interval_ms < 0.0:
         raise ValueError("planner_guard_ms and planner_min_interval_ms must be non-negative")
     dynamics_backend = getattr(args, "dynamics_backend", "learned")
+    robustness = _robustness_config(args)
+    if robustness.enabled and dynamics_backend == "mujoco_oracle":
+        raise ValueError("Robustness perturbations are only defined for learned MPC and Direct IK, not mujoco_oracle")
     if dynamics_backend == "mujoco_oracle":
         if args.controller_mode != "mpc" or args.mpc_policy != "residual":
             raise ValueError("mujoco_oracle requires --controller_mode mpc --mpc_policy residual")
@@ -559,11 +590,13 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
             device=device,
             history_len=args.history_len,
         )
-    env = MuJoCoArmEnv(str(resolve_runtime_path(args.model_xml)), n_joints=args.n_joints, seed=args.seed)
+    env = _build_control_env(args)
 
     states_history: list[np.ndarray] = []
     q_ref_history: list[np.ndarray] = []
     actual_states: list[np.ndarray] = []
+    observed_states: list[np.ndarray] = []
+    observation_noise: list[np.ndarray] = []
     next_states: list[np.ndarray] = []
     selected_q_refs: list[np.ndarray] = []
     selected_delta_q_refs: list[np.ndarray] = []
@@ -602,7 +635,12 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
     recovery_active_flags: list[int] = []
     recovery_trigger_reasons: list[str] = []
     cost_term_records: dict[str, list[float]] = {name: [] for name in COST_TERM_NAMES}
-    torque_records: dict[str, list[np.ndarray]] = {"tau_actuator": [], "tau_gravity": [], "tau_total": []}
+    torque_records: dict[str, list[np.ndarray]] = {
+        "tau_actuator": [], "tau_gravity": [], "tau_total": [],
+        "tau_gravity_true": [], "tau_gravity_mismatch": [],
+    }
+    external_force_world_records: list[np.ndarray] = []
+    external_generalized_force_records: list[np.ndarray] = []
     desired_ee_positions: list[np.ndarray] = []
     desired_ee_rotations: list[np.ndarray] = []
     actual_ee_positions: list[np.ndarray] = []
@@ -619,21 +657,22 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
     try:
         if args.n_joints > MPC_HOME_Q.shape[0]:
             raise ValueError(f"MPC home pose supports at most {MPC_HOME_Q.shape[0]} joints, got {args.n_joints}")
-        state = env.reset_to_configuration(MPC_HOME_Q[: args.n_joints])
-        previous_q_ref = np.asarray(state[: args.n_joints], dtype=np.float32).copy()
+        true_state = env.reset_to_configuration(MPC_HOME_Q[: args.n_joints])
+        previous_q_ref = np.asarray(true_state[: args.n_joints], dtype=np.float32).copy()
         previous_q_ref_velocity = np.zeros(args.n_joints, dtype=np.float32)
         previous_residual = np.zeros(args.n_joints, dtype=np.float32)
         previous_residual_velocity = np.zeros(args.n_joints, dtype=np.float32)
         recovery_remaining = 0
         residual_saturation_streak = 0
         for _ in range(args.settle_steps):
-            state = env.step(previous_q_ref)
+            true_state = env.step(previous_q_ref)
+        state = env.get_observation()
         states_history.append(state.copy())
         q_ref_history.append(previous_q_ref.copy())
 
         reference, dq_reference, ddq_reference, execution_steps, task_reference = _reference_for_run(
             args=args,
-            state=state,
+            state=true_state,
             env=env,
             control_dt=bundle.control_dt if bundle is not None else None,
         )
@@ -675,7 +714,7 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
             actuator_kp = actuator_kd = torque_scale = delta_torque_scale = None
             w_tau = w_delta_tau = 0.0
             if args.cost_profile == "actuator_aware":
-                actuator_kp, actuator_kd = env.position_actuator_gains
+                actuator_kp, actuator_kd = env.nominal_position_actuator_gains
                 torque_scale = np.maximum(actuator_kp * q_ref_velocity_limit * env.control_dt, 1.0).astype(np.float32)
                 delta_torque_scale = np.maximum(
                     actuator_kp * q_ref_acceleration_limit * (env.control_dt**2), 0.5
@@ -1003,7 +1042,9 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
                 sampling_std_end_mean = float("nan")
 
             torque = env.compute_torque_components(q_ref_command)
-            actual_states.append(state.copy())
+            actual_states.append(true_state.copy())
+            observed_states.append(state.copy())
+            observation_noise.append((state - true_state).astype(np.float32))
             q_des_records.append(reference[step_idx].copy())
             dq_des_records.append(dq_reference[step_idx].copy())
             if args.controller_mode == "mpc" and args.mpc_policy == "residual":
@@ -1056,20 +1097,28 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
             failure_reasons.append(failure_reason)
             for name in COST_TERM_NAMES:
                 cost_term_records[name].append(float(selected_cost_terms.get(name, np.nan)))
-            for key, target_key in (("actuator_tau", "tau_actuator"), ("gravity_tau", "tau_gravity"), ("total_tau", "tau_total")):
+            for key, target_key in (
+                ("actuator_tau", "tau_actuator"), ("gravity_tau", "tau_gravity"),
+                ("total_tau", "tau_total"), ("true_gravity_tau", "tau_gravity_true"),
+                ("gravity_mismatch_tau", "tau_gravity_mismatch"),
+            ):
                 torque_records[target_key].append(torque[key].astype(np.float32))
 
             # Commit the command to the current state before advancing the
             # simulator, matching training tokens [x_t, u_t].
             q_ref_history[-1] = q_ref_command.copy()
+            external_force = _force_for_step(robustness, step_idx, execution_steps)
             try:
-                state = env.step(q_ref_command)
+                true_state = env.step(q_ref_command, external_force_world=external_force)
+                state = env.get_observation()
                 joint_limit_violations.append(0)
             except RuntimeError:
                 joint_limit_violations.append(1)
                 if args.fail_on_limit_violation:
                     raise
                 break
+            external_force_world_records.append(env.last_external_force_world.astype(np.float32).copy())
+            external_generalized_force_records.append(env.last_external_generalized_force.astype(np.float32).copy())
             control_step_wall_times.append(time.perf_counter() - control_step_started)
 
             if (
@@ -1091,11 +1140,11 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
                         time.sleep(remaining)
                     viewer_deadline += env.control_dt
 
-            next_states.append(state.copy())
+            next_states.append(true_state.copy())
             if args.controller_mode == "mpc" and np.all(np.isfinite(predicted_next_state)):
-                predicted_next_q_errors.append(float(np.linalg.norm(predicted_next_state[: args.n_joints] - state[: args.n_joints])))
+                predicted_next_q_errors.append(float(np.linalg.norm(predicted_next_state[: args.n_joints] - true_state[: args.n_joints])))
                 predicted_next_dq_errors.append(
-                    float(np.linalg.norm(predicted_next_state[args.n_joints :] - state[args.n_joints :]))
+                    float(np.linalg.norm(predicted_next_state[args.n_joints :] - true_state[args.n_joints :]))
                 )
             else:
                 predicted_next_q_errors.append(float("nan"))
@@ -1105,7 +1154,7 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
             previous_q_ref_velocity = (q_ref_command - previous_q_ref) / env.control_dt
             previous_q_ref = q_ref_command.copy()
             commit_command_and_append_placeholder(states_history, q_ref_history, q_ref_command, state)
-            realized_error = float(np.linalg.norm(state[: args.n_joints] - reference[step_idx + 1]))
+            realized_error = float(np.linalg.norm(true_state[: args.n_joints] - reference[step_idx + 1]))
             realized_tracking_errors.append(realized_error)
             if args.controller_mode == "mpc" and args.mpc_policy == "residual":
                 previous_residual_velocity = (executed_residual - previous_residual) / env.control_dt
@@ -1207,6 +1256,8 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
     arrays: dict[str, np.ndarray] = {
         "controller_mode": np.asarray(args.controller_mode),
         "actual_states": _stack_records(actual_states),
+        "observed_states": _stack_records(observed_states),
+        "observation_noise": _stack_records(observation_noise),
         "next_states": _stack_records(next_states),
         "q_des": _stack_records(q_des_records),
         "dq_des": _stack_records(dq_des_records),
@@ -1245,6 +1296,8 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
         "multirate_buffer_mode": np.asarray(multirate_buffer_modes),
         "recovery_active_flags": np.asarray(recovery_active_flags, dtype=np.int64),
         "recovery_trigger_reasons": np.asarray(recovery_trigger_reasons),
+        "external_force_world": _stack_records(external_force_world_records),
+        "external_generalized_force": _stack_records(external_generalized_force_records),
         "cem_reset_std_each_step": np.asarray(args.reset_std_each_step),
         "cem_init_std": np.asarray(args.init_std, dtype=np.float32),
         "cem_min_std": np.asarray(args.min_std, dtype=np.float32),
@@ -1291,7 +1344,11 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
         **{f"cost_{name}": np.asarray(values, dtype=np.float32) for name, values in cost_term_records.items()},
         **replay_arrays,
         **{key: _stack_records(value) for key, value in torque_records.items()},
+        **config_arrays(robustness, env),
     }
+    pulse_start, pulse_stop = robustness.pulse_window(execution_steps)
+    arrays["force_pulse_start_step"] = np.asarray(pulse_start, dtype=np.int64)
+    arrays["force_pulse_stop_step"] = np.asarray(pulse_stop, dtype=np.int64)
     if task_reference is not None:
         arrays.update(
             {

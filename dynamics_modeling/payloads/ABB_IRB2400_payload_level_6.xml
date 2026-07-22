@@ -1,0 +1,81 @@
+<mujoco model="ABB IRB2400 payload level 6">
+  <compiler angle="radian" meshdir="../abb_irb2400_assets"/>
+  <option timestep="0.002" integrator="RK4"/>
+  <default>
+    <joint damping="2" armature="0.01"/>
+    <geom type="mesh" mass="0" contype="0" conaffinity="0" friction="0.8 0.005 0.0001" rgba="1.0 0.42 0.05 1"/>
+  </default>
+  <asset>
+    <mesh name="base_link_mesh" file="base_link_visual.stl"/>
+    <mesh name="link_1_mesh" file="link_1_visual.stl"/>
+    <mesh name="link_2_mesh" file="link_2_visual.stl"/>
+    <mesh name="link_3_mesh" file="link_3_visual.stl"/>
+    <mesh name="link_4_mesh" file="link_4_visual.stl"/>
+    <mesh name="link_5_mesh" file="link_5_visual.stl"/>
+    <mesh name="link_6_mesh" file="link_6_visual.stl"/>
+    <mesh name="link_lever_a_mesh" file="link_lever_a_visual.stl"/>
+    <mesh name="link_lever_b_mesh" file="link_lever_b_visual.stl"/>
+  </asset>
+  <worldbody>
+    <light name="top" pos="0 0 4" dir="0 0 -1"/>
+    <geom name="ground" type="plane" pos="0 0 0" size="5 5 0.1" rgba="0.85 0.85 0.85 1"/>
+    <body name="base_link" pos="0 0 0">
+      <inertial pos="-0.1007 0.0004 0.0898" mass="80" diaginertia="4.0 3.0 1.8"/>
+      <geom name="base_link_geom" mesh="base_link_mesh"/>
+      <body name="link_1" pos="0 0 0">
+        <inertial pos="0.0121 0.0254 0.4706" mass="150" diaginertia="9.0 7.0 5.5"/>
+        <joint name="joint_1" type="hinge" axis="0 0 1" limited="true" range="-3.1416 3.1416"/>
+        <geom name="link_1_geom" mesh="link_1_mesh"/>
+        <body name="link_2" pos="0.1 0 0.615">
+          <inertial pos="0.0315 -0.0067 0.2622" mass="60" diaginertia="2.5 2.3 0.45"/>
+          <joint name="joint_2" type="hinge" axis="0 1 0" limited="true" range="-1.7453 1.9199"/>
+          <geom name="link_2_geom" mesh="link_2_mesh"/>
+          <body name="link_lever_a" pos="0 0 0">
+            <inertial pos="-0.0627 -0.0584 -0.0080" mass="2" diaginertia="0.010 0.0085 0.0025"/>
+            <geom name="link_lever_a_geom" mesh="link_lever_a_mesh" rgba="0.02 0.02 0.02 1"/>
+          </body>
+          <body name="link_3" pos="0 0 0.705">
+            <inertial pos="-0.0043 -0.0150 0.0986" mass="35" diaginertia="0.9 0.8 0.4"/>
+            <joint name="joint_3" type="hinge" axis="0 1 0" limited="true" range="-1.0472 1.1345"/>
+            <geom name="link_3_geom" mesh="link_3_mesh"/>
+            <body name="link_lever_b" pos="-0.18 0 0">
+              <inertial pos="0.0076 -0.0440 -0.3351" mass="3" diaginertia="0.14 0.14 0.003"/>
+              <geom name="link_lever_b_geom" mesh="link_lever_b_mesh" rgba="0.02 0.02 0.02 0"/>
+            </body>
+            <body name="link_4" pos="0 0 0.135">
+              <inertial pos="0.45 0 0" mass="30" diaginertia="0.3 1.0 0.8"/>
+              <joint name="joint_4" type="hinge" axis="1 0 0" limited="true" range="-3.49 3.49"/>
+              <geom name="link_4_geom" mesh="link_4_mesh"/>
+              <body name="link_5" pos="0.755 0 0">
+                <inertial pos="0 0 0" mass="12" diaginertia="0.12 0.08 0.08"/>
+                <joint name="joint_5" type="hinge" axis="0 1 0" limited="true" range="-2.0944 2.0944"/>
+                <geom name="link_5_geom" mesh="link_5_mesh"/>
+                <body name="link_6" pos="0 0 0">
+                  <inertial pos="0.04 0 0" mass="8" diaginertia="0.04 0.04 0.015"/>
+                  <joint name="joint_6" type="hinge" axis="1 0 0" limited="true" range="-6.9813 6.9813"/>
+                  <geom name="link_6_geom" mesh="link_6_mesh" rgba="0.02 0.02 0.02 1"/>
+                  <body name="tool0" pos="0.085 0 0" quat="0.707106781 0 0.707106781 0">
+                    <site name="tool0" size="0.025" rgba="0.1 0.4 1 1"/>
+                    <site name="ee_site" size="0.015" rgba="0.1 0.8 0.2 1"/>
+                    <body name="payload" pos="0.10 0 0">
+                      <inertial pos="0 0 0" mass="12.0" diaginertia="0.0096000 0.0448000 0.0448000"/>
+                      <geom name="payload_geom" type="cylinder" size="0.04 0.10" quat="0.707106781 0 0.707106781 0" mass="0" rgba="0.25 0.25 0.28 1"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="joint_1_position" joint="joint_1" kp="1000" dampratio="1" ctrllimited="true" ctrlrange="-3.1416 3.1416"/>
+    <position name="joint_2_position" joint="joint_2" kp="1900" dampratio="1" ctrllimited="true" ctrlrange="-1.7453 1.9199"/>
+    <position name="joint_3_position" joint="joint_3" kp="1600" dampratio="1" ctrllimited="true" ctrlrange="-1.0472 1.1345"/>
+    <position name="joint_4_position" joint="joint_4" kp="1200" dampratio="1" ctrllimited="true" ctrlrange="-3.49 3.49"/>
+    <position name="joint_5_position" joint="joint_5" kp="500" dampratio="1" ctrllimited="true" ctrlrange="-2.0944 2.0944"/>
+    <position name="joint_6_position" joint="joint_6" kp="150" dampratio="1" ctrllimited="true" ctrlrange="-6.9813 6.9813"/>
+  </actuator>
+</mujoco>

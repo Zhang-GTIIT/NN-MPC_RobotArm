@@ -15,6 +15,51 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ModelABCSummaryTests(unittest.TestCase):
+    def test_no_feedback_ablation_only_duplicates_learned_models(self) -> None:
+        specs = [
+            {"label": "DirectIK", "kind": "direct_ik"},
+            {"label": "Oracle", "kind": "oracle"},
+            {"label": "A", "kind": "learned"},
+        ]
+        expanded = MODULE.expand_model_specs(specs, True)
+        self.assertEqual([item["label"] for item in expanded], ["DirectIK", "Oracle", "A", "A_NoFeedback"])
+        self.assertTrue(expanded[-1]["no_feedback"])
+        self.assertNotIn("no_feedback", specs[-1])
+
+    def test_robustness_summary_reports_noise_force_and_activity(self) -> None:
+        actual = np.zeros((30, 4), dtype=np.float32)
+        observed = actual.copy()
+        observed[:, :2] = 0.001
+        observed[:, 2:] = 0.02
+        tracking = np.full(30, 0.001, dtype=np.float32)
+        tracking[10:15] = np.asarray((0.02, 0.015, 0.01, 0.006, 0.004), dtype=np.float32)
+        arrays = {
+            "actual_states": actual,
+            "observed_states": observed,
+            "ee_position_errors": tracking,
+            "force_pulse_start_step": np.asarray(10),
+            "force_pulse_stop_step": np.asarray(12),
+            "force_pulse_level": np.asarray(2),
+            "force_pulse_n": np.asarray(100.0),
+            "payload_level": np.asarray(1),
+            "actuator_gain_level": np.asarray(3),
+            "observation_noise_level": np.asarray(4),
+            "payload_mass_kg": np.asarray(1.0),
+            "executed_residual": np.zeros((30, 2)),
+            "residual_max": np.ones(2),
+            "feedback_correction": np.zeros((30, 2)),
+            "feedback_max": np.ones(2),
+            "command_acceleration": np.ones((30, 2)),
+            "actuator_q_ref": np.arange(60, dtype=np.float32).reshape(30, 2),
+            "packet_age": np.asarray([-1] * 3 + [0] * 27),
+        }
+        summary = MODULE.robustness_summary(arrays)
+        self.assertAlmostEqual(summary["observation_q_rmse_rad"], 0.001)
+        self.assertAlmostEqual(summary["observation_dq_rmse_rad_s"], 0.02)
+        self.assertAlmostEqual(summary["force_peak_tracking_error"], 0.02)
+        self.assertEqual(summary["force_recovery_steps"], 2.0)
+        self.assertAlmostEqual(summary["direct_ik_fallback_rate"], 0.1)
+
     def test_threaded_sparse_solve_fields_are_aggregated_finitely(self) -> None:
         arrays = {
             "realized_tracking_error": np.array([1.0, 2.0, 3.0], dtype=np.float32),

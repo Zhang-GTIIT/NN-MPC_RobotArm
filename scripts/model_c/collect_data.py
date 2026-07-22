@@ -162,6 +162,12 @@ def _write_shard(output_dir: Path, shard_index: int, records: dict[str, list[np.
 
 def main() -> None:
     args = parse_args()
+    robustness_levels = {
+        name: int(getattr(args, name, 0))
+        for name in ("payload_level", "actuator_gain_level", "force_pulse_level", "observation_noise_level")
+    }
+    if any(robustness_levels.values()):
+        raise ValueError(f"Model-C collection forbids robustness perturbations: {robustness_levels}")
     if args.multirate_mode != "virtual_asap" or args.episode_len != 500:
         raise ValueError("Model-C collection requires --multirate_mode virtual_asap and --episode_len 500")
     expected = {"model_type": "gru", "history_len": 16, "horizon": 25, "branch_horizon": 25, "num_samples": 128, "cem_iters": 2, "replan_interval_steps": 5}

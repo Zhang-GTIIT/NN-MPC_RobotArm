@@ -31,7 +31,7 @@ def _sha256(path: Path) -> str:
 def _runner_defaults() -> dict[str, Any]:
     module = load_runner("model_c_benchmark_runner")
     defaults = vars(module.build_arg_parser().parse_args([]))
-    excluded = {"checkpoint", "normalizer", "model_type", "history_len", "device", "seed", "save_dir", "reference_mode", "reference_file", "episode_len", "horizon", "anticipation_delay_steps", "multirate_mode"}
+    excluded = {"checkpoint", "normalizer", "model_type", "history_len", "device", "seed", "save_dir", "reference_mode", "reference_file", "episode_len", "horizon", "anticipation_delay_steps", "multirate_mode", "payload_level", "actuator_gain_level", "force_pulse_level", "observation_noise_level"}
     return {key: value for key, value in defaults.items() if key not in excluded}
 
 

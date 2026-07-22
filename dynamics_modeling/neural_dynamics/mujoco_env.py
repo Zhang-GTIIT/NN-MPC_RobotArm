@@ -20,10 +20,15 @@ class MuJoCoArmEnv:
         n_joints: int = 6,
         control_mode: str = "position",
         gravity_compensation: bool = True,
+        gravity_compensation_model_xml: str | None = None,
+        actuator_kp_scale: float = 1.0,
+        actuator_kd_scale: float = 1.0,
         frame_skip: int = 5,
         dt: Optional[float] = None,
         seed: Optional[int] = None,
         observation_noise_std: float = 0.0,
+        observation_q_noise_std: float | None = None,
+        observation_dq_noise_std: float | None = None,
         observation_seed: Optional[int] = None,
     ) -> None:
         self.model_xml = Path(model_xml).expanduser()
@@ -48,12 +53,26 @@ class MuJoCoArmEnv:
             raise ValueError(
                 f"observation_seed must be non-negative when provided, got {observation_seed}"
             )
+        split_noise = observation_q_noise_std is not None or observation_dq_noise_std is not None
+        if split_noise and observation_noise_std != 0.0:
+            raise ValueError("observation_noise_std cannot be combined with split q/dq observation noise")
+        q_noise = observation_noise_std if observation_q_noise_std is None else observation_q_noise_std
+        dq_noise = observation_noise_std if observation_dq_noise_std is None else observation_dq_noise_std
+        if any(not np.isfinite(value) or value < 0.0 for value in (q_noise, dq_noise)):
+            raise ValueError("q/dq observation noise standard deviations must be finite and non-negative")
+        if any(not np.isfinite(value) or value <= 0.0 for value in (actuator_kp_scale, actuator_kd_scale)):
+            raise ValueError("actuator Kp/Kd scales must be finite and positive")
+
         self.n_joints = int(n_joints)
         self.control_mode = control_mode
         self.gravity_compensation = bool(gravity_compensation)
         self.frame_skip = int(frame_skip)
         self.rng = np.random.default_rng(seed)
         self.observation_noise_std = float(observation_noise_std)
+        self.observation_q_noise_std = float(q_noise)
+        self.observation_dq_noise_std = float(dq_noise)
+        self.actuator_kp_scale = float(actuator_kp_scale)
+        self.actuator_kd_scale = float(actuator_kd_scale)
 
         if observation_seed is None:
             observation_seed_source: int | np.random.SeedSequence = (
@@ -64,8 +83,21 @@ class MuJoCoArmEnv:
 
         self._observation_rng = np.random.default_rng(observation_seed_source)
         self.model = mujoco.MjModel.from_xml_path(str(self.model_xml))
+        self._apply_actuator_gain_scales()
         self.data = mujoco.MjData(self.model)
-        self._gravity_data = mujoco.MjData(self.model) if self.gravity_compensation else None
+        compensation_path = self.model_xml if gravity_compensation_model_xml is None else Path(gravity_compensation_model_xml).expanduser()
+        if self.gravity_compensation and not compensation_path.exists():
+            raise FileNotFoundError(f"Gravity-compensation XML does not exist: {compensation_path}")
+        self.gravity_compensation_model_xml = compensation_path
+        self._gravity_model = (
+            self.model
+            if not self.gravity_compensation or compensation_path.resolve() == self.model_xml.resolve()
+            else mujoco.MjModel.from_xml_path(str(compensation_path))
+        )
+        self._gravity_data = mujoco.MjData(self._gravity_model) if self.gravity_compensation else None
+        self._plant_gravity_data = mujoco.MjData(self.model)
+        self.last_external_force_world = np.zeros(3, dtype=np.float64)
+        self.last_external_generalized_force = np.zeros(self.n_joints, dtype=np.float64)
         if self.model.nu < self.n_joints:
             raise ValueError(
                 f"Actuator count mismatch: model has {self.model.nu} actuators, "
@@ -75,6 +107,13 @@ class MuJoCoArmEnv:
             raise ValueError(
                 f"Joint state dimension mismatch: model has nq={self.model.nq}, nv={self.model.nv}, "
                 f"but n_joints={self.n_joints}."
+            )
+        if self.gravity_compensation and (
+            self._gravity_model.nq != self.model.nq or self._gravity_model.nv != self.model.nv
+        ):
+            raise ValueError(
+                "Plant and gravity-compensation models must have identical nq/nv, got "
+                f"plant=({self.model.nq},{self.model.nv}) compensation=({self._gravity_model.nq},{self._gravity_model.nv})"
             )
         if dt is not None:
             if dt <= 0:
@@ -115,6 +154,22 @@ class MuJoCoArmEnv:
             raise ValueError("Position actuator metadata does not provide finite non-negative Kp/Kd gains")
         return kp.copy(), kd.copy()
 
+    @property
+    def nominal_position_actuator_gains(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._nominal_actuator_kp.copy(), self._nominal_actuator_kd.copy()
+
+    def _apply_actuator_gain_scales(self) -> None:
+        count = min(self.n_joints, self.model.nu)
+        kp = np.asarray(self.model.actuator_gainprm[:count, 0], dtype=np.float64).copy()
+        kd = -np.asarray(self.model.actuator_biasprm[:count, 2], dtype=np.float64).copy()
+        self._nominal_actuator_kp = kp.astype(np.float32).copy()
+        self._nominal_actuator_kd = kd.astype(np.float32).copy()
+        kp *= self.actuator_kp_scale
+        kd *= self.actuator_kd_scale
+        self.model.actuator_gainprm[:count, 0] = kp
+        self.model.actuator_biasprm[:count, 1] = -kp
+        self.model.actuator_biasprm[:count, 2] = -kd
+
     def get_state(self) -> np.ndarray:
         qpos = np.asarray(self.data.qpos[: self.n_joints], dtype=np.float64)
         qvel = np.asarray(self.data.qvel[: self.n_joints], dtype=np.float64)
@@ -122,15 +177,13 @@ class MuJoCoArmEnv:
     def get_observation(self) -> np.ndarray:
         state = self.get_state()
 
-        if self.observation_noise_std == 0.0:
+        if self.observation_q_noise_std == 0.0 and self.observation_dq_noise_std == 0.0:
             return state
-
-        noise = self._observation_rng.normal(
-            loc=0.0,
-            scale=self.observation_noise_std,
-            size=state.shape,
-        )
-
+        scale = np.concatenate((
+            np.full(self.n_joints, self.observation_q_noise_std, dtype=np.float64),
+            np.full(self.n_joints, self.observation_dq_noise_std, dtype=np.float64),
+        ))
+        noise = self._observation_rng.normal(loc=0.0, scale=scale)
         return (state.astype(np.float64) + noise).astype(np.float32)
 
     @property
@@ -167,18 +220,24 @@ class MuJoCoArmEnv:
             f"{self.joint_high[joint_idx]:.8f}]"
         )
 
+    def _gravity_force(self, model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
+        mujoco.mj_resetData(model, data)
+        data.qpos[: model.nq] = self.data.qpos[: model.nq]
+        data.qvel[: model.nv] = 0.0
+        mujoco.mj_forward(model, data)
+        return np.asarray(data.qfrc_bias[: self.n_joints], dtype=np.float64).copy()
+
     def _gravity_compensation_force(self) -> np.ndarray:
         if self._gravity_data is None:
             return np.zeros(self.n_joints, dtype=np.float64)
-        mujoco.mj_resetData(self.model, self._gravity_data)
-        self._gravity_data.qpos[: self.model.nq] = self.data.qpos[: self.model.nq]
-        self._gravity_data.qvel[: self.model.nv] = 0.0
-        mujoco.mj_forward(self.model, self._gravity_data)
-        gravity_tau = np.asarray(self._gravity_data.qfrc_bias[: self.n_joints], dtype=np.float64).copy()
+        gravity_tau = self._gravity_force(self._gravity_model, self._gravity_data)
         for joint_idx in self._ZERO_GRAVITY_COMPENSATION_JOINT_INDICES:
             if joint_idx < self.n_joints:
                 gravity_tau[joint_idx] = 0.0
         return gravity_tau
+
+    def true_gravity_force(self) -> np.ndarray:
+        return self._gravity_force(self.model, self._plant_gravity_data)
 
     def compute_torque_components(self, action: np.ndarray | None = None) -> dict[str, np.ndarray]:
         if action is not None:
@@ -194,23 +253,58 @@ class MuJoCoArmEnv:
         self.data.qfrc_applied[: self.n_joints] = gravity_tau
         mujoco.mj_forward(self.model, self.data)
         actuator_tau = np.asarray(self.data.qfrc_actuator[: self.n_joints], dtype=np.float64).copy()
+        true_gravity = self.true_gravity_force()
         return {
             "actuator_tau": actuator_tau,
             "gravity_tau": gravity_tau.copy(),
             "total_tau": actuator_tau + gravity_tau,
+            "true_gravity_tau": true_gravity,
+            "gravity_mismatch_tau": true_gravity - gravity_tau,
         }
 
-    def step(self, action: np.ndarray) -> np.ndarray:
+    def _apply_external_force(self, force_world: np.ndarray, site_name: str) -> np.ndarray:
+        force = np.asarray(force_world, dtype=np.float64)
+        if force.shape != (3,):
+            raise ValueError(f"External force must have shape (3,), got {force.shape}")
+        generalized = np.zeros(self.model.nv, dtype=np.float64)
+        if not np.any(force):
+            return generalized[: self.n_joints]
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+        if site_id < 0:
+            raise ValueError(f"External-force site does not exist: {site_name}")
+        body_id = int(self.model.site_bodyid[site_id])
+        mujoco.mj_applyFT(
+            self.model, self.data, force, np.zeros(3, dtype=np.float64),
+            np.asarray(self.data.site_xpos[site_id], dtype=np.float64), body_id, generalized,
+        )
+        self.data.qfrc_applied[: self.model.nv] += generalized
+        return generalized[: self.n_joints].copy()
+
+    def step(
+        self,
+        action: np.ndarray,
+        *,
+        external_force_world: np.ndarray | None = None,
+        external_force_site_name: str = "ee_site",
+    ) -> np.ndarray:
         action_array = np.asarray(action, dtype=np.float64)
         if action_array.shape != (self.n_joints,):
             raise ValueError(f"Action must have shape ({self.n_joints},), got {action_array.shape}")
 
         action_array = np.clip(action_array, self.action_low, self.action_high)
+        force = np.zeros(3, dtype=np.float64) if external_force_world is None else np.asarray(external_force_world, dtype=np.float64)
+        if force.shape != (3,) or np.any(~np.isfinite(force)):
+            raise ValueError("external_force_world must contain three finite values")
         self.data.ctrl[: self.n_joints] = action_array
+        last_generalized = np.zeros(self.n_joints, dtype=np.float64)
         for _ in range(self.frame_skip):
+            self.data.qfrc_applied[:] = 0.0
             if self.gravity_compensation:
                 self.data.qfrc_applied[: self.n_joints] = self._gravity_compensation_force()
+            last_generalized = self._apply_external_force(force, external_force_site_name)
             mujoco.mj_step(self.model, self.data)
+        self.last_external_force_world = force.copy()
+        self.last_external_generalized_force = last_generalized
         self.validate_joint_positions("step")
         return self.get_state()
 
@@ -220,6 +314,8 @@ class MuJoCoArmEnv:
         self.data.qvel[: self.n_joints] = self.rng.uniform(-0.05, 0.05, size=self.n_joints)
         self.data.ctrl[: self.n_joints] = 0.0
         self.data.qfrc_applied[: self.n_joints] = 0.0
+        self.last_external_force_world.fill(0.0)
+        self.last_external_generalized_force.fill(0.0)
         mujoco.mj_forward(self.model, self.data)
         self.validate_joint_positions("reset_random")
         return self.get_state()
@@ -234,6 +330,8 @@ class MuJoCoArmEnv:
         self.data.qvel[: self.n_joints] = 0.0
         self.data.ctrl[: self.n_joints] = np.clip(qpos_array, self.action_low, self.action_high)
         self.data.qfrc_applied[: self.n_joints] = 0.0
+        self.last_external_force_world.fill(0.0)
+        self.last_external_generalized_force.fill(0.0)
         mujoco.mj_forward(self.model, self.data)
         self.validate_joint_positions("reset_to_configuration")
         return self.get_state()

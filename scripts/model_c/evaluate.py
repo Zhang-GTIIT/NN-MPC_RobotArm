@@ -83,8 +83,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--case_ids", default=None, help="Optional comma-separated benchmark case IDs.")
     parser.add_argument("--resume", action="store_true", help="Reuse completed case/spec rollouts only when their fingerprint matches exactly.")
     parser.add_argument("--candidate_metrics", action="append", default=[], help="Optional label,path JSON produced by analyze_candidate_branches.py; repeatable.")
+    parser.add_argument(
+        "--include_no_feedback_ablation", action="store_true",
+        help="Duplicate each learned model with feedback_kq=feedback_kdq=feedback_max=0.",
+    )
     parser.set_defaults(save_dir="outputs/mpc/model_abc")
     return parser.parse_args(argv)
+
+
+def expand_model_specs(
+    model_specs: list[dict[str, object]], include_no_feedback_ablation: bool
+) -> list[dict[str, object]]:
+    """Add feedback-disabled learned baselines without mutating input specs."""
+    expanded = [dict(spec) for spec in model_specs]
+    if include_no_feedback_ablation:
+        for spec in model_specs:
+            if spec["kind"] == "learned":
+                duplicate = dict(spec)
+                duplicate["label"] = f"{spec['label']}_NoFeedback"
+                duplicate["no_feedback"] = True
+                expanded.append(duplicate)
+    labels = [str(spec["label"]) for spec in expanded]
+    if len(labels) != len(set(labels)):
+        raise ValueError("Every --model_spec label must be unique, including generated NoFeedback labels")
+    return expanded
 
 
 def summarize(label: str, arrays: dict[str, np.ndarray], dataset_path: str) -> dict[str, float | str | int]:
@@ -115,7 +137,7 @@ def summarize(label: str, arrays: dict[str, np.ndarray], dataset_path: str) -> d
     packet_age = np.asarray(arrays.get("packet_age", np.empty(0)), dtype=np.float64)
     solve_count = int(np.asarray(arrays.get("planner_solve_count", np.sum(replanned))).reshape(-1)[0])
     late_drop_count = int(np.asarray(arrays.get("planner_late_drop_count", 0)).reshape(-1)[0])
-    return {
+    result: dict[str, float | str | int] = {
         "label": label,
         "dynamics_backend": str(np.asarray(arrays.get("dynamics_backend", "not_applicable")).reshape(-1)[0]),
         "dataset_path": dataset_path,
@@ -145,6 +167,81 @@ def summarize(label: str, arrays: dict[str, np.ndarray], dataset_path: str) -> d
         "replay_q_error_kH_mean": finite_mean(replay_q_terminal),
         "replay_dq_error_k1_mean": finite_mean(replay_dq_first),
         "replay_dq_error_kH_mean": finite_mean(replay_dq_terminal),
+    }
+    result.update(robustness_summary(arrays))
+    return result
+
+
+def robustness_summary(arrays: dict[str, np.ndarray]) -> dict[str, float | int]:
+    """Summarise disturbance strength, recovery, noise, and command activity."""
+    scalar_int = lambda key: int(np.asarray(arrays.get(key, 0)).reshape(-1)[0])
+    scalar_float = lambda key, default=0.0: float(np.asarray(arrays.get(key, default)).reshape(-1)[0])
+    actual = np.asarray(arrays.get("actual_states", np.empty((0, 0))), dtype=np.float64)
+    observed = np.asarray(arrays.get("observed_states", np.empty((0, 0))), dtype=np.float64)
+    n_joints = actual.shape[1] // 2 if actual.ndim == 2 and actual.shape[1] else 0
+    noise = observed - actual if observed.shape == actual.shape else np.empty((0, 0))
+    position_error = np.asarray(arrays.get("ee_position_errors", np.empty(0)), dtype=np.float64)
+    tracking = position_error if position_error.size else np.asarray(arrays.get("realized_tracking_error", np.empty(0)), dtype=np.float64)
+    start = scalar_int("force_pulse_start_step")
+    stop = scalar_int("force_pulse_stop_step")
+    force_level = scalar_int("force_pulse_level")
+    recovery_steps = float("nan")
+    peak_post = float("nan")
+    integral_above_baseline = float("nan")
+    if force_level and tracking.size and 0 < start < len(tracking):
+        finite_tracking = np.where(np.isfinite(tracking), tracking, np.nan)
+        baseline_slice = finite_tracking[max(0, start - 50) : start]
+        baseline = float(np.nanmean(baseline_slice)) if np.any(np.isfinite(baseline_slice)) else 0.0
+        threshold_floor = 0.005 if position_error.size else 0.05
+        threshold = max(1.5 * baseline, threshold_floor)
+        post = finite_tracking[min(stop, len(tracking)) :]
+        peak_region = finite_tracking[start:]
+        peak_post = float(np.nanmax(peak_region)) if np.any(np.isfinite(peak_region)) else float("nan")
+        integral_above_baseline = float(np.nansum(np.maximum(peak_region - baseline, 0.0)) * 0.01)
+        for offset in range(max(0, len(post) - 9)):
+            window = post[offset : offset + 10]
+            if len(window) == 10 and np.all(np.isfinite(window)) and np.all(window <= threshold):
+                recovery_steps = float(offset)
+                break
+    residual = np.asarray(arrays.get("executed_residual", np.empty((0, 0))), dtype=np.float64)
+    residual_max = np.asarray(arrays.get("residual_max", np.empty(0)), dtype=np.float64).reshape(-1)
+    residual_saturation = (
+        float(np.mean(np.any(np.abs(residual) >= 0.95 * residual_max, axis=1)))
+        if residual.ndim == 2 and residual.size and residual.shape[1] == residual_max.size else float("nan")
+    )
+    feedback = np.asarray(arrays.get("feedback_correction", np.empty((0, 0))), dtype=np.float64)
+    feedback_max = np.asarray(arrays.get("feedback_max", np.empty(0)), dtype=np.float64).reshape(-1)
+    feedback_saturation = (
+        float(np.mean(np.any(np.abs(feedback) >= 0.95 * feedback_max, axis=1)))
+        if feedback.ndim == 2 and feedback.size and feedback.shape[1] == feedback_max.size and np.any(feedback_max > 0)
+        else float("nan")
+    )
+    acceleration = np.asarray(arrays.get("command_acceleration", np.empty((0, 0))), dtype=np.float64)
+    command = np.asarray(arrays.get("actuator_q_ref", np.empty((0, 0))), dtype=np.float64)
+    packet_age = np.asarray(arrays.get("packet_age", np.empty(0)), dtype=np.float64)
+    return {
+        "payload_level": scalar_int("payload_level"),
+        "actuator_gain_level": scalar_int("actuator_gain_level"),
+        "force_pulse_level": force_level,
+        "observation_noise_level": scalar_int("observation_noise_level"),
+        "payload_mass_kg": scalar_float("payload_mass_kg"),
+        "actuator_kp_scale": scalar_float("actuator_kp_scale", 1.0),
+        "actuator_kd_scale": scalar_float("actuator_kd_scale", 1.0),
+        "force_pulse_n": scalar_float("force_pulse_n"),
+        "observation_q_std_rad": scalar_float("observation_q_std_rad"),
+        "observation_dq_std_rad_s": scalar_float("observation_dq_std_rad_s"),
+        "observation_q_rmse_rad": float(np.sqrt(np.mean(noise[:, :n_joints] ** 2))) if noise.size and n_joints else float("nan"),
+        "observation_dq_rmse_rad_s": float(np.sqrt(np.mean(noise[:, n_joints:] ** 2))) if noise.size and n_joints else float("nan"),
+        "force_peak_tracking_error": peak_post,
+        "force_integrated_error_above_baseline": integral_above_baseline,
+        "force_recovery_steps": recovery_steps,
+        "force_recovery_time_s": recovery_steps * 0.01 if np.isfinite(recovery_steps) else float("nan"),
+        "residual_saturation_rate": residual_saturation,
+        "feedback_saturation_rate": feedback_saturation,
+        "feedback_rms_rad": float(np.sqrt(np.mean(feedback**2))) if feedback.size else float("nan"),
+        "command_acceleration_rms_rad_s2": float(np.sqrt(np.mean(acceleration**2))) if acceleration.size else float("nan"),
+        "command_total_variation_rad": float(np.sum(np.abs(np.diff(command, axis=0)))) if command.ndim == 2 and len(command) > 1 else float("nan"),
+        "direct_ik_fallback_rate": float(np.mean(packet_age < 0)) if packet_age.size else float("nan"),
     }
 
 
@@ -177,7 +274,11 @@ def paired_bootstrap(rows: list[dict[str, float | str | int]], samples: int, see
     reference, initial state and CEM seed fixed within each comparison.
     """
     labels = sorted({str(row["label"]) for row in rows})
-    metrics = ("failure_rate", "tracking_error_mean", "joint_position_rmse_rad", "replay_q_error_kH_mean")
+    metrics = (
+        "failure_rate", "tracking_error_mean", "joint_position_rmse_rad", "replay_q_error_kH_mean",
+        "force_peak_tracking_error", "force_recovery_time_s", "force_integrated_error_above_baseline",
+        "command_acceleration_rms_rad_s2", "command_total_variation_rad",
+    )
     rng = np.random.default_rng(seed)
     output: dict[str, object] = {"bootstrap_samples": samples, "seed": seed, "comparisons": {}}
     by_label_case = {(str(row["label"]), str(row["case_id"])): row for row in rows}
@@ -230,9 +331,10 @@ def build_run_fingerprint(
     """Describe every behavior-affecting input used by one benchmark rollout."""
     excluded = {
         "allow_final_benchmark", "bootstrap_samples", "bootstrap_seed", "candidate_metrics",
-        "case_ids", "manifest", "model_spec", "resume", "save_dir",
+        "case_ids", "include_no_feedback_ablation", "manifest", "model_spec", "resume", "save_dir",
     }
     run_config = {key: value for key, value in vars(run_args).items() if key not in excluded}
+    robustness = RUN_CEM_MPC._robustness_config(run_args)
     payload = {
         "schema_version": 1,
         "case_id": case_id,
@@ -242,6 +344,8 @@ def build_run_fingerprint(
         "checkpoint": _input_file_identity(spec.get("checkpoint")),
         "normalizer": _input_file_identity(spec.get("normalizer")),
         "reference": _input_file_identity(run_config.get("reference_file")),
+        "nominal_model": _input_file_identity(robustness.nominal_model_xml),
+        "plant_model": _input_file_identity(robustness.plant_model_xml),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return {"sha256": hashlib.sha256(canonical).hexdigest(), "payload": payload}
@@ -294,11 +398,14 @@ def main() -> None:
         if expected_hash is not None:
             if not isinstance(reference_file, str) or sha256(Path(reference_file)) != expected_hash:
                 raise ValueError(f"Benchmark reference hash mismatch for case {case.get('id')}")
-    model_specs = [parse_model_spec(value) for value in args.model_spec]
-    labels = [str(spec["label"]) for spec in model_specs]
-    if len(labels) != len(set(labels)):
-        raise ValueError("Every --model_spec label must be unique")
+    model_specs = expand_model_specs(
+        [parse_model_spec(value) for value in args.model_spec], args.include_no_feedback_ablation
+    )
     rows: list[dict[str, float | str | int]] = []
+    robustness_overrides = {
+        key: int(getattr(args, key))
+        for key in ("payload_level", "actuator_gain_level", "force_pulse_level", "observation_noise_level")
+    }
     for case_index, case in enumerate(cases):
         if not isinstance(case, dict):
             raise ValueError("Each benchmark case must be an object")
@@ -314,6 +421,8 @@ def main() -> None:
             for key, value in case.get("run_args", case).items():
                 if key != "id" and hasattr(run_args, key):
                     setattr(run_args, key, value)
+            for key, value in robustness_overrides.items():
+                setattr(run_args, key, value)
             if kind == "direct_ik":
                 run_args.controller_mode = "ik_direct"
                 run_args.multirate_mode = "synchronous"
@@ -333,6 +442,10 @@ def main() -> None:
                 run_args.checkpoint = str(spec["checkpoint"])
                 run_args.normalizer = str(spec["normalizer"])
                 run_args.model_type = str(spec["model_type"])
+                if spec.get("no_feedback"):
+                    run_args.feedback_kq = 0.0
+                    run_args.feedback_kdq = 0.0
+                    run_args.feedback_max = "0"
             run_dir = save_root / case_id / str(spec["label"])
             run_args.save_dir = str(run_dir)
             fingerprint = build_run_fingerprint(case_id, case, spec, run_args)

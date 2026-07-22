@@ -82,6 +82,26 @@ class MuJoCoArmObservationTest(unittest.TestCase):
         self.assertTrue(np.all(np.abs(empirical_mean) < 5.0e-4))
         self.assertTrue(np.all(np.abs(empirical_std - noise_std) < 7.5e-4))
 
+    def test_split_q_and_dq_noise_have_independent_scales(self) -> None:
+        q_std, dq_std = 0.001, 0.02
+        env = self.make_env(
+            seed=47,
+            observation_q_noise_std=q_std,
+            observation_dq_noise_std=dq_std,
+            observation_seed=53,
+        )
+        truth = env.get_state()
+        samples = np.stack([env.get_observation() - truth for _ in range(5000)], axis=0)
+        empirical_std = samples.std(axis=0)
+        self.assertTrue(np.all(np.abs(empirical_std[:N_JOINTS] - q_std) < 8.0e-5))
+        self.assertTrue(np.all(np.abs(empirical_std[N_JOINTS:] - dq_std) < 1.5e-3))
+
+    def test_legacy_and_split_noise_cannot_be_combined(self) -> None:
+        with self.assertRaises(ValueError):
+            MuJoCoArmEnv(
+                str(MODEL_XML), observation_noise_std=0.01, observation_q_noise_std=0.001
+            )
+
     def test_invalid_observation_noise_configuration_is_rejected(self) -> None:
         for invalid_std in (-0.1, float("nan"), float("inf")):
             with self.subTest(observation_noise_std=invalid_std):

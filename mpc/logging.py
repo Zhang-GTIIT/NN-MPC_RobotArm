@@ -166,6 +166,18 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
         "mpc_policy": str(np.asarray(arrays.get("mpc_policy", "not_applicable")).reshape(-1)[0]),
         "cost_profile": str(np.asarray(arrays.get("cost_profile", "not_applicable")).reshape(-1)[0]),
         "recorded_steps": int(actual_states.shape[0]) if actual_states.ndim else 0,
+        "robustness": {
+            "payload_level": int(np.asarray(arrays.get("payload_level", 0)).reshape(-1)[0]),
+            "actuator_gain_level": int(np.asarray(arrays.get("actuator_gain_level", 0)).reshape(-1)[0]),
+            "force_pulse_level": int(np.asarray(arrays.get("force_pulse_level", 0)).reshape(-1)[0]),
+            "observation_noise_level": int(np.asarray(arrays.get("observation_noise_level", 0)).reshape(-1)[0]),
+            "payload_mass_kg": float(np.asarray(arrays.get("payload_mass_kg", 0.0)).reshape(-1)[0]),
+            "actuator_kp_scale": float(np.asarray(arrays.get("actuator_kp_scale", 1.0)).reshape(-1)[0]),
+            "actuator_kd_scale": float(np.asarray(arrays.get("actuator_kd_scale", 1.0)).reshape(-1)[0]),
+            "force_pulse_n": float(np.asarray(arrays.get("force_pulse_n", 0.0)).reshape(-1)[0]),
+            "observation_q_std_rad": float(np.asarray(arrays.get("observation_q_std_rad", 0.0)).reshape(-1)[0]),
+            "observation_dq_std_rad_s": float(np.asarray(arrays.get("observation_dq_std_rad_s", 0.0)).reshape(-1)[0]),
+        },
         "timing": {
             "control_step_wall_time_s": _finite_stats(np.asarray(arrays.get("control_step_wall_time", np.empty(0)))),
             "planning_time_s": _finite_stats(replan_time),
@@ -618,6 +630,12 @@ def _plot_task_space_run(plt: Any, save_dir: Path, arrays: dict[str, np.ndarray]
 
 
 def plot_mpc_run(save_dir: Path, arrays: dict[str, np.ndarray]) -> None:
+    # Rollout logging is batch/headless work.  Do not let Matplotlib select a
+    # Tk backend: threaded_asap has a worker thread, and Tk objects destroyed
+    # during interpreter shutdown otherwise emit "main thread is not in main
+    # loop" errors even though the rollout itself completed successfully.
+    import matplotlib
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     actual_states = arrays["actual_states"]
