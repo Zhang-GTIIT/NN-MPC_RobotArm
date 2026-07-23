@@ -45,7 +45,7 @@ class MuJoCoOraclePlanner:
         return self.nominal_q_ref
 
     def evaluate(self, candidate_action: torch.Tensor) -> dict[str, torch.Tensor]:
-        q_ref_sequences, residual_sequences, feasible = construct_residual_q_ref_sequence(
+        q_ref_sequences, residual_sequences, projected_nominal_offsets, feasible = construct_residual_q_ref_sequence(
             candidate_action,
             nominal_q_ref=self.nominal_sequence(),
             residual_max=self.rollout_config.residual_max,
@@ -58,6 +58,14 @@ class MuJoCoOraclePlanner:
             q_ref_acceleration_limit=self.rollout_config.q_ref_acceleration_limit,
             control_dt=self.cost_config.control_dt,
             project_kinematics=self.rollout_config.project_residual_kinematics,
+            enforce_projected_offset_bound=self.rollout_config.residual_feasibility_semantics == "projected_bound",
+        )
+        if self.rollout_config.residual_cost_semantics not in {"requested", "projected_offset"}:
+            raise ValueError("residual_cost_semantics must be 'requested' or 'projected_offset'")
+        residual_cost_sequence = (
+            residual_sequences
+            if self.rollout_config.residual_cost_semantics == "requested"
+            else projected_nominal_offsets
         )
         batch_size, horizon, _ = q_ref_sequences.shape
         device, dtype = candidate_action.device, candidate_action.dtype
@@ -93,6 +101,8 @@ class MuJoCoOraclePlanner:
             joint_high=self.joint_high.to(device=device, dtype=dtype),
             config=self.cost_config,
             nominal_q_ref=self.nominal_sequence().to(device=device, dtype=dtype),
+            requested_residual=residual_sequences,
+            residual_cost_sequence=residual_cost_sequence,
             previous_residual=None
             if self.previous_residual is None
             else self.previous_residual.to(device=device, dtype=dtype),
@@ -108,6 +118,14 @@ class MuJoCoOraclePlanner:
             "cost_terms": cost_terms,
             "q_ref_sequences": q_ref_sequences,
             "residual_sequences": residual_sequences,
+            "requested_residual_sequences": residual_sequences,
+            "projected_nominal_offsets": projected_nominal_offsets,
+            "residual_cost_sequences": residual_cost_sequence,
             "candidate_feasible": feasible,
+            "requested_residual_valid": torch.all(torch.isfinite(residual_sequences), dim=(1, 2)),
+            "projected_command_valid": torch.all(torch.isfinite(q_ref_sequences), dim=(1, 2)),
+            "rollout_valid": simulated_t & torch.all(torch.isfinite(pred_states), dim=(1, 2)),
+            "hard_state_constraint_valid": cost_terms["hard_state_constraint_violation"] == 0,
+            "cost_valid": torch.isfinite(costs),
             "pred_states": pred_states,
         }

@@ -5,7 +5,10 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,10 +34,30 @@ class ThreadedASAPDefaultTests(unittest.TestCase):
         self.assertEqual(args.multirate_mode, "threaded_asap")
         self.assertEqual(args.delay_protocol, "full")
         self.assertEqual(args.ik_preview_steps, 0)
+        self.assertEqual(args.planner_projection, "off")
+        self.assertEqual(args.residual_cost_semantics, "requested")
+        self.assertEqual(args.packet_residual_semantics, "requested")
+        self.assertEqual(args.residual_feasibility_semantics, "finite")
+        self.assertEqual(args.nominal_command_semantics, "raw_ik")
+        self.assertEqual(args.ik_command_projection, "raw")
 
     def test_budget_sweep_defaults_to_and_accepts_threaded_asap(self) -> None:
         with mock.patch.object(sys, "argv", ["run_cem_budget_sweep.py"]):
             self.assertEqual(SWEEP.parse_args().multirate_mode, "threaded_asap")
+
+    def test_task_reference_validation_honors_execution_cap(self) -> None:
+        bundle = SimpleNamespace(
+            q_des=np.zeros((10, 6), dtype=np.float32),
+            dq_des=np.zeros((10, 6), dtype=np.float32),
+            execution_steps=8,
+            task_positions_des=np.zeros((10, 3), dtype=np.float32),
+            task_rotations_des=np.zeros((10, 3, 3), dtype=np.float32),
+            segment_ids=np.zeros(10, dtype=np.int64),
+            lap_ids=np.zeros(10, dtype=np.int64),
+        )
+        with self.assertRaisesRegex(ValueError, "too short"):
+            RUNNER._validate_task_reference(bundle, 6, 3)
+        RUNNER._validate_task_reference(bundle, 6, 3, execution_steps=6)
         with mock.patch.object(sys, "argv", ["run_cem_budget_sweep.py", "--multirate_mode", "threaded_asap"]):
             self.assertEqual(SWEEP.parse_args().multirate_mode, "threaded_asap")
 

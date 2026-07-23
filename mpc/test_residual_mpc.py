@@ -18,8 +18,8 @@ from mpc.cost_functions import JointSpaceCostConfig, joint_space_tracking_cost
 from mpc.logging import build_run_summary
 from mpc.planner_rollout import construct_residual_q_ref_sequence, reanchor_residual_command
 from mpc.delay_aware import corrected_direct_ik_command, corrected_direct_ik_command_np, feedback_correction
-from mpc.asap_shared import LatestSnapshotStore, PlanPacketStore
-from mpc.asap_types import ASAPPlanPacket, PlanningSnapshot
+from mpc.asap_shared import LatestSnapshotStore, PacketFallbackStateMachine, PlanPacketStore, PlannerResultStore
+from mpc.asap_types import ASAPPlanPacket, PlannerResultEvent, PlanningSnapshot
 from mpc.recovery import residual_recovery_reason
 
 
@@ -56,7 +56,7 @@ class ResidualConstraintTests(unittest.TestCase):
 
     def test_zero_residual_is_the_executable_nominal_baseline(self) -> None:
         nominal = torch.tensor([[0.02], [0.05]], dtype=torch.float32)
-        q_ref, residual, feasible = construct_residual_q_ref_sequence(
+        q_ref, residual, projected_offset, feasible = construct_residual_q_ref_sequence(
             torch.zeros((2, 2, 1)),
             nominal_q_ref=nominal,
             residual_max=torch.tensor([0.1]),
@@ -71,7 +71,22 @@ class ResidualConstraintTests(unittest.TestCase):
         )
         torch.testing.assert_close(q_ref, nominal.unsqueeze(0).expand_as(q_ref))
         torch.testing.assert_close(residual, torch.zeros_like(residual))
+        torch.testing.assert_close(projected_offset, torch.zeros_like(projected_offset))
         self.assertTrue(bool(torch.all(feasible)))
+
+    def test_legacy_projected_offset_bound_is_optional(self) -> None:
+        common = dict(
+            candidate_normalized_residual=torch.zeros((1, 1, 1)),
+            nominal_q_ref=torch.tensor([[0.8]]), residual_max=torch.tensor([0.1]),
+            previous_q_ref=torch.tensor([0.0]), previous_q_ref_velocity=torch.tensor([0.0]),
+            joint_low=torch.tensor([-1.0]), joint_high=torch.tensor([1.0]), joint_limit_margin=0.0,
+            q_ref_velocity_limit=torch.tensor([0.1]), q_ref_acceleration_limit=torch.tensor([0.1]),
+            control_dt=0.01,
+        )
+        self.assertTrue(bool(construct_residual_q_ref_sequence(**common)[3][0]))
+        self.assertFalse(bool(construct_residual_q_ref_sequence(
+            **common, enforce_projected_offset_bound=True,
+        )[3][0]))
 
     def test_cached_residual_is_reanchored_and_reprojected(self) -> None:
         command, executed, feasible = reanchor_residual_command(
@@ -109,7 +124,7 @@ class ResidualConstraintTests(unittest.TestCase):
         torch.testing.assert_close(command, torch.tensor([0.10]))
         torch.testing.assert_close(executed, torch.tensor([0.0]))
 
-    def test_direct_ik_zero_correction_bypasses_stale_command_projection(self) -> None:
+    def test_zero_correction_returns_to_nominal_through_projection(self) -> None:
         command, correction = corrected_direct_ik_command(
             nominal_q_des=torch.tensor([0.30]),
             correction=torch.tensor([0.0]),
@@ -122,8 +137,8 @@ class ResidualConstraintTests(unittest.TestCase):
             acceleration_limit=torch.tensor([0.1]),
             control_dt=0.01,
         )
-        torch.testing.assert_close(command, torch.tensor([0.30]))
-        torch.testing.assert_close(correction, torch.tensor([0.0]))
+        self.assertLessEqual(float(command[0]), 1.1e-5)
+        torch.testing.assert_close(correction, command - torch.tensor([0.30]))
 
     def test_feedback_has_the_planned_tracking_sign_and_is_bounded(self) -> None:
         correction = feedback_correction(
@@ -135,7 +150,7 @@ class ResidualConstraintTests(unittest.TestCase):
         )
         np.testing.assert_allclose(correction, np.array([0.05], dtype=np.float32))
 
-    def test_numpy_direct_ik_projection_preserves_zero_and_limits(self) -> None:
+    def test_numpy_direct_ik_projection_limits_zero_and_nonzero_corrections(self) -> None:
         command, residual = corrected_direct_ik_command_np(
             nominal_q_des=np.array([0.3], dtype=np.float32), correction=np.array([0.0], dtype=np.float32),
             previous_q_ref=np.array([0.0], dtype=np.float32), previous_q_ref_velocity=np.array([0.0], dtype=np.float32),
@@ -143,8 +158,8 @@ class ResidualConstraintTests(unittest.TestCase):
             joint_limit_margin=0.0, velocity_limit=np.array([0.1], dtype=np.float32),
             acceleration_limit=np.array([0.1], dtype=np.float32), control_dt=0.01,
         )
-        np.testing.assert_allclose(command, [0.3])
-        np.testing.assert_allclose(residual, [0.0])
+        self.assertLessEqual(float(command[0]), 1.1e-5)
+        np.testing.assert_allclose(residual, command - np.array([0.3], dtype=np.float32), atol=1e-7)
         command, _ = corrected_direct_ik_command_np(
             np.array([1.0], dtype=np.float32), np.array([1.0], dtype=np.float32), np.array([0.0], dtype=np.float32),
             np.array([0.0], dtype=np.float32), np.array([-2.0], dtype=np.float32), np.array([2.0], dtype=np.float32),
@@ -162,8 +177,8 @@ class ASAPStoreTests(unittest.TestCase):
 
     def test_latest_snapshot_coalesces_and_copies_arrays(self) -> None:
         store = LatestSnapshotStore()
-        first = PlanningSnapshot(0, 0, 0, np.zeros((1, 2), dtype=np.float32), np.zeros((1, 1), dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), ())
-        second = PlanningSnapshot(1, 1, 1, np.ones((1, 2), dtype=np.float32), np.ones((1, 1), dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), ())
+        first = PlanningSnapshot(0, 0, 0, np.zeros((1, 2), dtype=np.float32), np.zeros((1, 1), dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32), ())
+        second = PlanningSnapshot(1, 1, 1, np.ones((1, 2), dtype=np.float32), np.ones((1, 1), dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), np.ones(1, dtype=np.float32), ())
         store.publish(first); store.publish(second)
         received = store.wait_for_newer(-1, 0.0)
         self.assertIsNotNone(received)
@@ -179,6 +194,38 @@ class ASAPStoreTests(unittest.TestCase):
         self.assertIsNotNone(active)
         assert active is not None
         self.assertEqual(active.plan_id, 2)
+
+    def test_planner_result_events_are_delivered_once_in_order(self) -> None:
+        store = PlannerResultStore()
+        for result_id, result_type in ((0, "planner_failure"), (1, "success_published")):
+            store.publish(PlannerResultEvent(
+                result_id=result_id, request_id=result_id + 10, result_type=result_type,
+                reason_code="all_costs_invalid" if result_id == 0 else "", reason_detail="",
+                plan_id=-1 if result_id == 0 else 4, planning_time_s=0.01,
+                end_to_end_latency_s=0.02, candidate_count=8, valid_candidate_count=4,
+            ))
+        self.assertEqual([event.result_id for event in store.drain()], [0, 1])
+        self.assertEqual(store.drain(), [])
+
+    def test_packet_gap_state_machine_distinguishes_startup_failure_and_recovery(self) -> None:
+        machine = PacketFallbackStateMachine()
+        startup = machine.update(None)
+        self.assertEqual(startup.state, "STARTUP_NO_PACKET")
+        self.assertEqual(startup.packet_expired_event, 0)
+        first = machine.update(4)
+        self.assertEqual(first.first_packet_activated_event, 1)
+        self.assertEqual(first.fallback_ended_event, 1)
+        machine.observe_result("planner_failure")
+        self.assertEqual(machine.update(4).state, "PACKET_ACTIVE")
+        gap = machine.update(None)
+        self.assertEqual(gap.state, "GAP_AFTER_PLANNER_FAILURE")
+        self.assertEqual(gap.packet_expired_event, 1)
+        self.assertEqual(gap.fallback_started_event, 1)
+        self.assertEqual(machine.expiration_count, 1)
+        replacement = machine.update(5)
+        self.assertEqual(replacement.state, "PACKET_ACTIVE")
+        self.assertEqual(replacement.fallback_ended_event, 1)
+        self.assertEqual(machine.last_blocking_result_type, "")
 
 
 class ResidualCostTests(unittest.TestCase):
@@ -205,6 +252,7 @@ class ResidualCostTests(unittest.TestCase):
             dq_des=torch.zeros((2, 1)),
             actuator_q_ref=torch.zeros((1, 2, 1)),
             nominal_q_ref=torch.zeros((2, 1)),
+            requested_residual=torch.zeros((1, 2, 1)),
             previous_q_ref=torch.zeros(1),
             previous_q_ref_velocity=torch.zeros(1),
             previous_residual=torch.zeros(1),
@@ -227,6 +275,7 @@ class ResidualCostTests(unittest.TestCase):
             dq_des=torch.zeros((2, 1)),
             actuator_q_ref=torch.zeros((1, 2, 1)),
             nominal_q_ref=torch.zeros((2, 1)),
+            requested_residual=torch.zeros((1, 2, 1)),
             previous_q_ref=torch.zeros(1),
             previous_q_ref_velocity=torch.zeros(1),
             previous_residual=torch.zeros(1),
@@ -236,6 +285,36 @@ class ResidualCostTests(unittest.TestCase):
             config=self._config(),
         )
         self.assertTrue(bool(torch.isinf(cost[0])))
+
+    def test_residual_cost_is_independent_of_projection_lag(self) -> None:
+        requested = torch.tensor([[[0.02], [0.03]]])
+        common = dict(
+            pred_states=torch.zeros((1, 3, 2)), q_des=torch.zeros((2, 1)), dq_des=torch.zeros((2, 1)),
+            requested_residual=requested, nominal_q_ref=torch.zeros((2, 1)),
+            previous_q_ref=torch.zeros(1), previous_q_ref_velocity=torch.zeros(1),
+            previous_residual=torch.zeros(1), previous_residual_velocity=torch.zeros(1),
+            joint_low=torch.tensor([-1.0]), joint_high=torch.tensor([1.0]), config=self._config(),
+            return_terms=True,
+        )
+        _, first = joint_space_tracking_cost(actuator_q_ref=requested.clone(), **common)
+        _, second = joint_space_tracking_cost(actuator_q_ref=requested + 0.10, **common)
+        for name in ("residual", "residual_velocity", "residual_acceleration", "first"):
+            torch.testing.assert_close(first[name], second[name])
+        self.assertFalse(torch.allclose(first["servo"], second["servo"]))
+
+    def test_diagnostic_projected_offset_can_drive_residual_cost(self) -> None:
+        requested = torch.zeros((1, 2, 1))
+        projected_offset = torch.tensor([[[0.02], [0.03]]])
+        _, terms = joint_space_tracking_cost(
+            pred_states=torch.zeros((1, 3, 2)), q_des=torch.zeros((2, 1)), dq_des=torch.zeros((2, 1)),
+            actuator_q_ref=projected_offset, requested_residual=requested,
+            residual_cost_sequence=projected_offset, nominal_q_ref=torch.zeros((2, 1)),
+            previous_q_ref=torch.zeros(1), previous_q_ref_velocity=torch.zeros(1),
+            previous_residual=torch.zeros(1), previous_residual_velocity=torch.zeros(1),
+            joint_low=torch.tensor([-1.0]), joint_high=torch.tensor([1.0]), config=self._config(),
+            return_terms=True,
+        )
+        self.assertGreater(float(terms["residual"][0]), 0.0)
 
 
 class _BaselinePlanner:

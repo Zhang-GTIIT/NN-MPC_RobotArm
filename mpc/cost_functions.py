@@ -131,6 +131,8 @@ def joint_space_tracking_cost(
     config: JointSpaceCostConfig,
     *,
     nominal_q_ref: torch.Tensor | None = None,
+    requested_residual: torch.Tensor | None = None,
+    residual_cost_sequence: torch.Tensor | None = None,
     previous_residual: torch.Tensor | None = None,
     previous_residual_velocity: torch.Tensor | None = None,
     return_terms: bool = False,
@@ -203,10 +205,17 @@ def joint_space_tracking_cost(
     if config.cost_mode == "residual":
         if nominal_q_ref is None:
             raise ValueError("nominal_q_ref is required for residual cost")
+        if requested_residual is None:
+            raise ValueError("requested_residual is required for residual cost")
         nominal = _expand_batch(
             _match_horizon(nominal_q_ref, horizon).to(device=pred_states.device, dtype=pred_states.dtype), batch_size
         )
-        residual = actuator_q_ref - nominal
+        residual_source = requested_residual if residual_cost_sequence is None else residual_cost_sequence
+        residual = residual_source.to(device=pred_states.device, dtype=pred_states.dtype)
+        if residual.shape != actuator_q_ref.shape:
+            raise ValueError(
+                f"requested_residual must have shape {tuple(actuator_q_ref.shape)}, got {tuple(residual.shape)}"
+            )
         residual_scale = _joint_vector(config.residual_scale, actuator_q_ref, "residual_scale")
         servo_scale = _joint_vector(config.servo_scale, actuator_q_ref, "servo_scale")
         residual_velocity_scale = _joint_vector(
@@ -246,6 +255,7 @@ def joint_space_tracking_cost(
     position_barrier = F.softplus((float(config.joint_limit_safe_margin) - margin) / float(config.joint_limit_temp))
     terms["joint_limit"] = _weighted_mean_plus_max(position_barrier, config.temporal_discount, config.barrier_max_weight)
     hard_joint_violation = torch.any((q_pred < joint_low) | (q_pred > joint_high), dim=(1, 2))
+    terms["hard_state_constraint_violation"] = hard_joint_violation.to(dtype=pred_states.dtype)
     if config.state_velocity_limit is None:
         terms["dq_limit"] = zero
     else:

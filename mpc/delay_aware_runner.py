@@ -14,8 +14,9 @@ import torch
 
 from neural_dynamics.rollout import rollout_dynamics_batch
 from mpc.cem_controller import CEMMPCConfig, CEMMPCController
+from mpc.constraints import project_nominal_q_ref_sequence
 from mpc.cost_functions import JointSpaceCostConfig
-from mpc.delay_aware import DelayedPlanPacket, corrected_direct_ik_command, feedback_correction
+from mpc.delay_aware import DelayedPlanPacket, corrected_direct_ik_command, feedback_correction, project_executable_command_np
 from mpc.delay_protocol import resolve_delay_protocol
 from mpc.history import commit_command_and_append_placeholder, future_history_tokens
 from mpc.model_c.oracle import MuJoCoOraclePlanner
@@ -97,30 +98,43 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
         rollout = PlannerRolloutConfig(
             mpc_policy="residual", q_ref_velocity_limit=t(physical_v), q_ref_acceleration_limit=t(physical_a),
             residual_max=t(residual_max), joint_limit_margin=args.joint_limit_margin,
-            rollout_batch_size=args.rollout_batch_size, project_residual_kinematics=True,
+            rollout_batch_size=args.rollout_batch_size, project_residual_kinematics=args.planner_projection == "on",
+            residual_cost_semantics=args.residual_cost_semantics,
+            residual_feasibility_semantics=args.residual_feasibility_semantics,
         )
         joint_low, joint_high = t(env.joint_low), t(env.joint_high)
         controller: CEMMPCController | None = None
         active: DelayedPlanPacket | None = None
         pending: dict[int, DelayedPlanPacket] = {}
+        previous_requested_mpc_residual = np.zeros(args.n_joints, dtype=np.float32)
+        previous_requested_mpc_residual_velocity = np.zeros(args.n_joints, dtype=np.float32)
+        previous_command_nominal_offset = np.zeros(args.n_joints, dtype=np.float32)
+        previous_command_nominal_offset_velocity = np.zeros(args.n_joints, dtype=np.float32)
         rec: dict[str, list[Any]] = {key: [] for key in (
-            "actual_states observed_states observation_noise next_states q_des dq_des actuator_q_ref delta_q_ref command_velocity command_acceleration planning_time replan_time mpc_replanned replan_deadline_miss control_step_wall_time buffer_index buffer_length best_cost mean_cost baseline_cost selected_cost elite_mean_cost selection_mode failure_flags joint_limit_violation_flags command_velocity_violation_flags command_acceleration_violation_flags realized_tracking_error nominal_q_ref planner_requested_residual buffered_residual feedback_raw feedback_correction requested_correction executed_residual projection_discrepancy residual_saturated feedback_saturated projection_active predicted_feedback_state packet_age packet_event tau_actuator tau_gravity tau_total tau_gravity_true tau_gravity_mismatch external_force_world external_generalized_force desired_ee_positions desired_ee_rotations actual_ee_positions actual_ee_rotations ee_position_errors ee_orientation_errors segment_ids lap_ids".split()
+            "actual_states observed_states observation_noise next_states q_des dq_des actuator_q_ref delta_q_ref command_velocity command_acceleration planning_time replan_time mpc_replanned replan_deadline_miss control_step_wall_time buffer_index buffer_length best_cost mean_cost baseline_cost selected_cost elite_mean_cost selection_mode failure_flags joint_limit_violation_flags command_velocity_violation_flags command_acceleration_violation_flags realized_tracking_error nominal_q_ref execution_nominal_q_ref planner_requested_residual buffered_residual requested_mpc_residual feedback_raw feedback_correction requested_feedback_correction requested_correction requested_total_correction requested_absolute_command executed_residual command_nominal_offset safety_projection_offset projection_discrepancy residual_saturated feedback_saturated projection_active predicted_feedback_state planned_q_ref planner_execution_qref_error packet_age packet_event tau_actuator tau_gravity tau_total tau_gravity_true tau_gravity_mismatch external_force_world external_generalized_force desired_ee_positions desired_ee_rotations actual_ee_positions actual_ee_rotations ee_position_errors ee_orientation_errors segment_ids lap_ids".split()
         )}
         rows: list[dict[str, Any]] = []
 
-        def active_action(absolute_step: int) -> np.ndarray:
-            nominal = reference[absolute_step + 1]
-            if active is not None:
-                index = active.index_at(absolute_step)
-                if index is not None:
-                    if protocol.replay_absolute and active.q_ref_sequence.shape == active.residual_sequence.shape:
-                        return active.q_ref_sequence[index].copy()
-                    return nominal + active.residual_sequence[index]
-            return nominal
+        def active_payload_residual(absolute_step: int) -> np.ndarray:
+            if active is None:
+                return np.zeros(args.n_joints, dtype=np.float32)
+            index = active.index_at(absolute_step)
+            if index is None:
+                return np.zeros(args.n_joints, dtype=np.float32)
+            return active.residual_sequence[index].copy()
+
+        def active_requested_residual(absolute_step: int) -> np.ndarray:
+            if active is None:
+                return np.zeros(args.n_joints, dtype=np.float32)
+            index = active.index_at(absolute_step)
+            if index is None:
+                return np.zeros(args.n_joints, dtype=np.float32)
+            sequence = active.requested_residual_sequence if active.requested_residual_sequence.shape == active.residual_sequence.shape else active.residual_sequence
+            return sequence[index].copy()
 
         def prediction_context(
             step: int,
-        ) -> tuple[torch.Tensor | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+        ) -> tuple[torch.Tensor | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
             if not protocol.future_state or delay == 0:
                 if bundle is not None:
                     current_history = api["build_history_tensor"](
@@ -130,14 +144,57 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                 else:
                     current_history = None
                     current_snapshot = env.capture_full_state()
+                previous_cost_residual = (
+                    previous_requested_mpc_residual
+                    if args.residual_cost_semantics == "requested"
+                    else previous_command_nominal_offset
+                )
+                previous_cost_residual_velocity = (
+                    previous_requested_mpc_residual_velocity
+                    if args.residual_cost_semantics == "requested"
+                    else previous_command_nominal_offset_velocity
+                )
                 return (
                     current_history,
                     np.asarray(state, dtype=np.float32).copy(),
                     previous_command.copy(),
                     previous_velocity.copy(),
+                    previous_cost_residual.copy(),
+                    previous_cost_residual_velocity.copy(),
                     current_snapshot,
                 )
-            actions = np.stack([active_action(step + i) for i in range(delay)]).astype(np.float32)
+            projected_actions: list[np.ndarray] = []
+            forecast_requested_residuals: list[np.ndarray] = []
+            forecast_command_offsets: list[np.ndarray] = []
+            forecast_command, forecast_velocity = previous_command.copy(), previous_velocity.copy()
+            for offset in range(delay):
+                nominal = np.asarray(reference[step + offset + 1], dtype=np.float32)
+                payload_residual = active_payload_residual(step + offset)
+                forecast_requested_residuals.append(active_requested_residual(step + offset))
+                execution_nominal = nominal
+                active_index = None if active is None else active.index_at(step + offset)
+                replay_cached_absolute = (
+                    protocol.replay_absolute
+                    and active is not None
+                    and active_index is not None
+                    and active.q_ref_sequence.shape == active.residual_sequence.shape
+                )
+                if replay_cached_absolute:
+                    execution_nominal = active.q_ref_sequence[active_index].copy()
+                    payload_residual = np.zeros(args.n_joints, dtype=np.float32)
+                elif args.nominal_command_semantics == "executable_ik":
+                    execution_nominal, _, _ = project_executable_command_np(
+                        nominal, np.zeros(args.n_joints, dtype=np.float32), forecast_command, forecast_velocity,
+                        env.joint_low, env.joint_high, args.joint_limit_margin, physical_v, physical_a, control_dt,
+                    )
+                command, _, forecast_velocity = project_executable_command_np(
+                    execution_nominal, payload_residual, forecast_command, forecast_velocity,
+                    env.joint_low, env.joint_high, args.joint_limit_margin, physical_v, physical_a, control_dt,
+                )
+                projected_actions.append(command)
+                forecast_command_offsets.append((command - execution_nominal).astype(np.float32))
+                forecast_command = command
+            actions = np.stack(projected_actions).astype(np.float32)
             if bundle is not None:
                 history = api["build_history_tensor"](states_history, command_history, bundle.history_len, device)
                 predicted = rollout_dynamics_batch(
@@ -157,11 +214,24 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                 future_history = None
                 anchor_snapshot = oracle_env.capture_full_state()
             velocity = previous_velocity if delay == 1 else (actions[-1] - actions[-2]) / control_dt
+            if args.residual_cost_semantics == "requested":
+                cost_residuals = forecast_requested_residuals
+                prior_cost_residual = previous_requested_mpc_residual
+            else:
+                cost_residuals = forecast_command_offsets
+                prior_cost_residual = previous_command_nominal_offset
+            anchor_residual = cost_residuals[-1]
+            anchor_residual_velocity = (
+                (cost_residuals[-1] - cost_residuals[-2]) / control_dt
+                if delay > 1 else (cost_residuals[-1] - prior_cost_residual) / control_dt
+            )
             return (
                 None if future_history is None else t(future_history),
                 predicted[-1],
                 actions[-1],
                 velocity.astype(np.float32),
+                anchor_residual.astype(np.float32),
+                anchor_residual_velocity.astype(np.float32),
                 anchor_snapshot,
             )
 
@@ -172,6 +242,7 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
             planner_requested = np.zeros(args.n_joints, dtype=np.float32)
             predicted_feedback = np.full(2 * args.n_joints, np.nan, dtype=np.float32)
             cached_absolute = nominal.copy()
+            planned_q_ref = np.full(args.n_joints, np.nan, dtype=np.float32)
             if active is not None:
                 packet_index = active.index_at(step)
                 if packet_index is not None:
@@ -184,6 +255,7 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                         planner_requested = plan_residual.copy()
                     if active.q_ref_sequence.shape == active.residual_sequence.shape:
                         cached_absolute = active.q_ref_sequence[age].copy()
+                        planned_q_ref = cached_absolute.copy()
             feedback_raw = np.zeros(args.n_joints, dtype=np.float32)
             feedback = np.zeros(args.n_joints, dtype=np.float32)
             if age >= 0 and protocol.feedback:
@@ -192,10 +264,18 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                     + float(args.feedback_kdq) * (predicted_feedback[args.n_joints :] - state[args.n_joints :])
                 ).astype(np.float32)
                 feedback = np.clip(feedback_raw, -feedback_max, feedback_max).astype(np.float32)
+            execution_nominal = nominal.copy()
+            if args.nominal_command_semantics == "executable_ik":
+                execution_nominal_t, _ = corrected_direct_ik_command(
+                    t(nominal), t(np.zeros(args.n_joints, dtype=np.float32)),
+                    t(previous_command), t(previous_velocity), joint_low, joint_high,
+                    args.joint_limit_margin, t(physical_v), t(physical_a), control_dt,
+                )
+                execution_nominal = execution_nominal_t.detach().cpu().numpy().astype(np.float32)
             if age < 0:
                 requested_correction = np.zeros(args.n_joints, dtype=np.float32)
                 command_t, correction_t = corrected_direct_ik_command(
-                    t(nominal), t(requested_correction), t(previous_command), t(previous_velocity),
+                    t(execution_nominal), t(requested_correction), t(previous_command), t(previous_velocity),
                     joint_low, joint_high, args.joint_limit_margin, t(physical_v), t(physical_a), control_dt,
                 )
                 command = command_t.detach().cpu().numpy().astype(np.float32)
@@ -207,29 +287,38 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                     residual_max + feedback_max,
                 )
                 command_t, correction_t = corrected_direct_ik_command(
-                    t(nominal), t(requested_correction), t(previous_command), t(previous_velocity),
+                    t(execution_nominal), t(requested_correction), t(previous_command), t(previous_velocity),
                     joint_low, joint_high, args.joint_limit_margin, t(physical_v), t(physical_a), control_dt,
                 )
                 command = command_t.detach().cpu().numpy().astype(np.float32)
                 executed = correction_t.detach().cpu().numpy().astype(np.float32)
             else:
-                # Cached-command protocols replay the absolute command that
-                # CEM actually evaluated at the predicted anchor.  Applying
-                # the 100 Hz velocity/acceleration projection again here
-                # would itself be execution-time reconciliation and make the
-                # ablation collapse back onto the full controller.
+                # Absolute-command ablations do not re-anchor to the current
+                # IK nominal, but still pass their cached target through the
+                # same physical safety projection as every other controller.
                 requested_correction = cached_absolute + feedback - nominal
-                command = np.clip(
-                    cached_absolute + feedback,
-                    env.joint_low + args.joint_limit_margin,
-                    env.joint_high - args.joint_limit_margin,
-                ).astype(np.float32)
+                command_t, _ = corrected_direct_ik_command(
+                    t(cached_absolute), t(feedback), t(previous_command), t(previous_velocity),
+                    joint_low, joint_high, args.joint_limit_margin, t(physical_v), t(physical_a), control_dt,
+                )
+                command = command_t.detach().cpu().numpy().astype(np.float32)
                 executed = (command - nominal).astype(np.float32)
             requested_correction = requested_correction.astype(np.float32)
-            discrepancy = (requested_correction - executed).astype(np.float32)
+            requested_absolute_command = (
+                cached_absolute + feedback
+                if age >= 0 and not protocol.reanchor_residual
+                else execution_nominal + requested_correction
+            ).astype(np.float32)
+            executed = (command - nominal).astype(np.float32)
+            safety_projection_offset = (command - requested_absolute_command).astype(np.float32)
+            discrepancy = (-safety_projection_offset).astype(np.float32)
+            planner_execution_qref_error = (
+                command - planned_q_ref if np.all(np.isfinite(planned_q_ref)) else np.full(args.n_joints, np.nan, dtype=np.float32)
+            ).astype(np.float32)
             return (
-                nominal, age, planner_requested, plan_residual, predicted_feedback, feedback_raw, feedback,
-                requested_correction, command, executed, discrepancy,
+                nominal, execution_nominal, age, planner_requested, plan_residual, predicted_feedback, feedback_raw, feedback,
+                requested_correction, requested_absolute_command, command, executed, safety_projection_offset,
+                discrepancy, planned_q_ref, planner_execution_qref_error,
             )
 
         for step in range(execution_steps):
@@ -253,23 +342,31 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                         cost_config=cost,
                     )
             (
-                nominal, age, planner_requested, plan_residual, predicted_feedback, feedback_raw, feedback,
-                requested_correction, command, executed, projection_discrepancy,
+                nominal, execution_nominal, age, planner_requested, plan_residual, predicted_feedback, feedback_raw, feedback,
+                requested_correction, requested_absolute_command, command, executed, safety_projection_offset,
+                projection_discrepancy, planned_q_ref, planner_execution_qref_error,
             ) = execution_for_step(step)
             planning_time = float("nan"); replanned = 0; failure = 0
             best = mean = baseline = selected = elite = float("nan")
             selection = "direct_ik_nominal" if age < 0 else "delayed_packet_feedback"
             if step % args.replan_interval_steps == 0 and step + delay + args.horizon < reference.shape[0]:
-                future_history, anchor_state, anchor_command, anchor_velocity, anchor_snapshot = prediction_context(step)
+                future_history, anchor_state, anchor_command, anchor_velocity, anchor_residual, anchor_residual_velocity, anchor_snapshot = prediction_context(step)
                 anchor = step + delay
                 reference_anchor = anchor if protocol.future_reference else step
                 future_q = t(reference[reference_anchor + 1 : reference_anchor + 1 + args.horizon])
+                planner_nominal = future_q
+                if args.nominal_command_semantics == "executable_ik":
+                    planner_nominal = project_nominal_q_ref_sequence(
+                        future_q, previous_q_ref=t(anchor_command), previous_q_ref_velocity=t(anchor_velocity),
+                        control_dt=control_dt, velocity_limit=t(physical_v), acceleration_limit=t(physical_a),
+                        joint_low=joint_low, joint_high=joint_high, joint_limit_margin=args.joint_limit_margin,
+                    )
                 common_planner_args = dict(
                     q_des=future_q,
                     dq_des=t(dq_reference[reference_anchor + 1 : reference_anchor + 1 + args.horizon]),
-                    nominal_q_ref=future_q, previous_q_ref=t(anchor_command), previous_q_ref_velocity=t(anchor_velocity),
-                    previous_residual=torch.zeros(args.n_joints, dtype=torch.float32, device=device),
-                    previous_residual_velocity=torch.zeros(args.n_joints, dtype=torch.float32, device=device),
+                    nominal_q_ref=planner_nominal, previous_q_ref=t(anchor_command), previous_q_ref_velocity=t(anchor_velocity),
+                    previous_residual=t(anchor_residual),
+                    previous_residual_velocity=t(anchor_residual_velocity),
                     joint_low=joint_low, joint_high=joint_high, cost_config=cost, rollout_config=rollout,
                 )
                 if bundle is not None:
@@ -311,13 +408,28 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                 if result.failure:
                     event = "planner_failure"
                 else:
+                    requested_sequence = result.selected_residual_sequence.copy()
+                    planner_nominal_np = planner_nominal.detach().cpu().numpy()
+                    projected_offset_sequence = (result.selected_q_ref_sequence - planner_nominal_np).astype(np.float32)
+                    packet_residual_sequence = (
+                        requested_sequence
+                        if args.packet_residual_semantics == "requested"
+                        else projected_offset_sequence
+                    )
+                    planned_projection_offset = (
+                        result.selected_q_ref_sequence - (planner_nominal_np + requested_sequence)
+                    ).astype(np.float32)
                     packet = DelayedPlanPacket(
-                        step, anchor, result.selected_residual_sequence.copy(),
-                        result.selected_predicted_state_sequence.copy(), planning_time, args.multirate_mode,
-                        result.branch_candidates, result.selected_q_ref_sequence.copy(),
-                        (
-                            np.clip(result.selected_action_sequence, -1.0, 1.0) * residual_max[None, :]
-                        ).astype(np.float32),
+                        launch_step=step,
+                        activation_step=anchor,
+                        residual_sequence=packet_residual_sequence,
+                        predicted_state_sequence=result.selected_predicted_state_sequence.copy(),
+                        planning_time_s=planning_time,
+                        mode=args.multirate_mode,
+                        branch_candidates=result.branch_candidates,
+                        q_ref_sequence=result.selected_q_ref_sequence.copy(),
+                        requested_residual_sequence=requested_sequence,
+                        planned_projection_offset_sequence=planned_projection_offset,
                     )
                     if delay == 0:
                         active = packet
@@ -334,9 +446,10 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                     event = (event + ";" if event else "") + schedule_event
                     if delay == 0:
                         (
-                            nominal, age, planner_requested, plan_residual, predicted_feedback,
-                            feedback_raw, feedback, requested_correction, command, executed,
-                            projection_discrepancy,
+                            nominal, execution_nominal, age, planner_requested, plan_residual, predicted_feedback,
+                            feedback_raw, feedback, requested_correction, requested_absolute_command,
+                            command, executed, safety_projection_offset, projection_discrepancy,
+                            planned_q_ref, planner_execution_qref_error,
                         ) = execution_for_step(step)
             delta = command - previous_command
             velocity, acceleration = delta / control_dt, (delta / control_dt - previous_velocity) / control_dt
@@ -352,18 +465,26 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
             state = env.get_observation()
             rec["next_states"].append(true_state.copy()); rec["external_force_world"].append(env.last_external_force_world.astype(np.float32).copy()); rec["external_generalized_force"].append(env.last_external_generalized_force.astype(np.float32).copy()); rec["actuator_q_ref"].append(command); rec["delta_q_ref"].append(delta); rec["command_velocity"].append(velocity); rec["command_acceleration"].append(acceleration)
             rec["planning_time"].append(0.0 if not np.isfinite(planning_time) else planning_time); rec["replan_time"].append(planning_time); rec["mpc_replanned"].append(replanned); rec["replan_deadline_miss"].append(int(np.isfinite(planning_time) and planning_time > delay * control_dt)); rec["control_step_wall_time"].append(api["time"].perf_counter() - started)
-            rec["buffer_index"].append(age); rec["buffer_length"].append(args.horizon if active is not None else 0); rec["best_cost"].append(best); rec["mean_cost"].append(mean); rec["baseline_cost"].append(baseline); rec["selected_cost"].append(selected); rec["elite_mean_cost"].append(elite); rec["selection_mode"].append(selection); rec["failure_flags"].append(failure); rec["joint_limit_violation_flags"].append(0); rec["command_velocity_violation_flags"].append(int(np.any(np.abs(velocity) > physical_v + 1e-6))); rec["command_acceleration_violation_flags"].append(int(np.any(np.abs(acceleration) > physical_a + 1e-6)))
+            rec["buffer_index"].append(age); rec["buffer_length"].append(args.horizon if active is not None else 0); rec["best_cost"].append(best); rec["mean_cost"].append(mean); rec["baseline_cost"].append(baseline); rec["selected_cost"].append(selected); rec["elite_mean_cost"].append(elite); rec["selection_mode"].append(selection); rec["failure_flags"].append(failure); rec["joint_limit_violation_flags"].append(0); rec["command_velocity_violation_flags"].append(int(np.any(np.abs(velocity) > physical_v + 1e-3))); rec["command_acceleration_violation_flags"].append(int(np.any(np.abs(acceleration) > physical_a + 1e-3)))
             residual_saturated = int(np.any(np.abs(planner_requested) >= 0.95 * residual_max))
             feedback_saturated = int(
                 protocol.feedback and age >= 0 and np.any(np.abs(feedback_raw) >= feedback_max - 1e-8)
             )
             projection_active = int(np.any(np.abs(projection_discrepancy) > 1e-6))
-            rec["nominal_q_ref"].append(nominal); rec["planner_requested_residual"].append(planner_requested); rec["buffered_residual"].append(plan_residual); rec["feedback_raw"].append(feedback_raw); rec["feedback_correction"].append(feedback); rec["requested_correction"].append(requested_correction); rec["executed_residual"].append(executed); rec["projection_discrepancy"].append(projection_discrepancy); rec["residual_saturated"].append(residual_saturated); rec["feedback_saturated"].append(feedback_saturated); rec["projection_active"].append(projection_active); rec["predicted_feedback_state"].append(predicted_feedback); rec["packet_age"].append(age); rec["packet_event"].append(event)
+            rec["nominal_q_ref"].append(nominal); rec["execution_nominal_q_ref"].append(execution_nominal); rec["planner_requested_residual"].append(planner_requested); rec["buffered_residual"].append(plan_residual); rec["requested_mpc_residual"].append(planner_requested); rec["feedback_raw"].append(feedback_raw); rec["feedback_correction"].append(feedback); rec["requested_feedback_correction"].append(feedback); rec["requested_correction"].append(requested_correction); rec["requested_total_correction"].append(requested_correction); rec["requested_absolute_command"].append(requested_absolute_command); rec["executed_residual"].append(executed); rec["command_nominal_offset"].append(executed); rec["safety_projection_offset"].append(safety_projection_offset); rec["projection_discrepancy"].append(projection_discrepancy); rec["residual_saturated"].append(residual_saturated); rec["feedback_saturated"].append(feedback_saturated); rec["projection_active"].append(projection_active); rec["predicted_feedback_state"].append(predicted_feedback); rec["planned_q_ref"].append(planned_q_ref); rec["planner_execution_qref_error"].append(planner_execution_qref_error); rec["packet_age"].append(age); rec["packet_event"].append(event)
             for source, target in (("actuator_tau", "tau_actuator"), ("gravity_tau", "tau_gravity"), ("total_tau", "tau_total"), ("true_gravity_tau", "tau_gravity_true"), ("gravity_mismatch_tau", "tau_gravity_mismatch")):
                 rec[target].append(torque[source].astype(np.float32))
             tracking = float(np.linalg.norm(true_state[: args.n_joints] - reference[step + 1])); rec["realized_tracking_error"].append(tracking)
             rows.append({"step": step, "controller_mode": "mpc", "tracking_error": tracking, "planning_time": planning_time, "replan_time": planning_time, "mpc_replanned": replanned, "replan_deadline_miss": rec["replan_deadline_miss"][-1], "multirate_mode": args.multirate_mode, "delay_protocol": protocol.name, "packet_event": event, "packet_age": age, "feedback_correction_norm": float(np.linalg.norm(feedback)), "executed_residual_norm": float(np.linalg.norm(executed)), "projection_discrepancy_norm": float(np.linalg.norm(projection_discrepancy)), "selection_mode": selection})
             previous_command, previous_velocity = command.copy(), velocity.astype(np.float32)
+            previous_requested_mpc_residual_velocity = (
+                planner_requested - previous_requested_mpc_residual
+            ) / control_dt
+            previous_requested_mpc_residual = planner_requested.copy()
+            previous_command_nominal_offset_velocity = (
+                (command - execution_nominal) - previous_command_nominal_offset
+            ) / control_dt
+            previous_command_nominal_offset = (command - execution_nominal).astype(np.float32)
             commit_command_and_append_placeholder(states_history, command_history, command, state)
     finally:
         env.close()
@@ -377,6 +498,13 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
     }
     arrays.update({
         "controller_mode": np.asarray("mpc"), "mpc_policy": np.asarray("residual"), "cost_profile": np.asarray(args.cost_profile),
+        "control_semantics_version": np.asarray(2, dtype=np.int64), "projection_semantics_version": np.asarray(2, dtype=np.int64),
+        "projection_backend": np.asarray("shared_physical_v2"), "planner_projection": np.asarray(args.planner_projection),
+        "residual_cost_semantics": np.asarray(args.residual_cost_semantics),
+        "packet_residual_semantics": np.asarray(args.packet_residual_semantics),
+        "residual_feasibility_semantics": np.asarray(args.residual_feasibility_semantics),
+        "nominal_command_semantics": np.asarray(args.nominal_command_semantics),
+        "projection_tolerance": np.asarray(1e-6, dtype=np.float32),
         "replan_interval_steps": np.asarray(args.replan_interval_steps, dtype=np.int64), "replan_deadline_s": np.asarray(delay * control_dt, dtype=np.float32),
         "multirate_mode": np.asarray(args.multirate_mode), "delay_protocol": np.asarray(protocol.name), "anticipation_delay_steps": np.asarray(delay, dtype=np.int64), "feedback_kq": np.asarray(args.feedback_kq, dtype=np.float32), "feedback_kdq": np.asarray(args.feedback_kdq, dtype=np.float32), "feedback_max": feedback_max, "residual_max": residual_max, "q_ref_velocity_limit": physical_v, "q_ref_acceleration_limit": physical_a,
         "dynamics_backend": np.asarray(dynamics_backend), "oracle_fixed_logical_delay": np.asarray(dynamics_backend == "mujoco_oracle"),

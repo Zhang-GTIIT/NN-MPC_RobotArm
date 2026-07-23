@@ -9,11 +9,20 @@ import numpy as np
 from mpc.utils import write_csv_rows
 
 
-def save_mpc_run(save_dir: Path, arrays: dict[str, np.ndarray], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def save_mpc_run(
+    save_dir: Path,
+    arrays: dict[str, np.ndarray],
+    rows: list[dict[str, Any]],
+    planner_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(save_dir / "rollout.npz", **arrays)
     write_csv_rows(save_dir / "rollout.csv", rows)
+    if planner_events is not None:
+        with (save_dir / "planner_events.jsonl").open("w", encoding="utf-8") as handle:
+            for event in planner_events:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
     summary = _task_tracking_summary(arrays)
     if summary is not None:
         with (save_dir / "task_tracking_summary.json").open("w", encoding="utf-8") as handle:
@@ -150,6 +159,8 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
         "actual_update_rate_hz": planner_rate,
         "late_drop_count": planner_late_drop_count,
         "late_drop_rate": float(planner_late_drop_count / planner_solve_count) if planner_solve_count else float("nan"),
+        "failure_count": int(np.asarray(arrays.get("planner_failure_count", 0)).reshape(-1)[0]),
+        "packet_expiration_count": int(np.asarray(arrays.get("packet_expiration_count", 0)).reshape(-1)[0]),
         "dynamics_backend": str(np.asarray(arrays.get("dynamics_backend", "not_applicable")).reshape(-1)[0]),
         "oracle_fixed_logical_delay": bool(
             np.asarray(arrays.get("oracle_fixed_logical_delay", False)).reshape(-1)[0]
@@ -161,7 +172,15 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
         "packet_publish_deadline_s": float(np.asarray(arrays.get("packet_publish_deadline_s", np.nan)).reshape(-1)[0]),
     }
     return {
-        "schema_version": 3,
+        "schema_version": 4,
+        "control_semantics_version": int(np.asarray(arrays.get("control_semantics_version", 0)).reshape(-1)[0]),
+        "projection_semantics_version": int(np.asarray(arrays.get("projection_semantics_version", 0)).reshape(-1)[0]),
+        "projection_backend": str(np.asarray(arrays.get("projection_backend", "legacy")).reshape(-1)[0]),
+        "planner_projection": str(np.asarray(arrays.get("planner_projection", "not_applicable")).reshape(-1)[0]),
+        "residual_cost_semantics": str(np.asarray(arrays.get("residual_cost_semantics", "not_applicable")).reshape(-1)[0]),
+        "packet_residual_semantics": str(np.asarray(arrays.get("packet_residual_semantics", "not_applicable")).reshape(-1)[0]),
+        "residual_feasibility_semantics": str(np.asarray(arrays.get("residual_feasibility_semantics", "not_applicable")).reshape(-1)[0]),
+        "nominal_command_semantics": str(np.asarray(arrays.get("nominal_command_semantics", "not_applicable")).reshape(-1)[0]),
         "controller_mode": str(controller_mode[0]) if controller_mode.size else "unknown",
         "mpc_policy": str(np.asarray(arrays.get("mpc_policy", "not_applicable")).reshape(-1)[0]),
         "cost_profile": str(np.asarray(arrays.get("cost_profile", "not_applicable")).reshape(-1)[0]),
@@ -204,6 +223,7 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
         "smoothness": {
             "command_velocity_p95_rad_s": _per_joint_percentile(np.asarray(arrays.get("command_velocity", np.empty((0,)))), 95.0),
             "command_acceleration_p95_rad_s2": _per_joint_percentile(np.asarray(arrays.get("command_acceleration", np.empty((0,)))), 95.0),
+            "command_acceleration_max_abs_rad_s2": _per_joint_percentile(np.asarray(arrays.get("command_acceleration", np.empty((0,)))), 100.0),
             "command_sign_flip_rate": _sign_flip_rate(np.asarray(arrays.get("command_velocity", np.empty((0,))))),
         },
         "actuator": {
@@ -212,7 +232,9 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
             "torque_slew_p95_nm_per_step": _per_joint_percentile(np.diff(np.asarray(arrays.get("tau_actuator", np.empty((0,)))), axis=0), 95.0),
         },
         "safety": {
-            "controller_failure_count": int(np.sum(np.asarray(arrays.get("failure_flags", np.empty(0))) != 0)),
+            "controller_failure_count": int(
+                np.asarray(arrays.get("planner_failure_count", np.sum(np.asarray(arrays.get("failure_flags", np.empty(0))) != 0))).reshape(-1)[0]
+            ),
             "joint_limit_violation_count": int(np.sum(np.asarray(arrays.get("joint_limit_violation_flags", np.empty(0))) != 0)),
             "command_velocity_violation_count": int(np.sum(np.asarray(arrays.get("command_velocity_violation_flags", np.empty(0))) != 0)),
             "command_acceleration_violation_count": int(np.sum(np.asarray(arrays.get("command_acceleration_violation_flags", np.empty(0))) != 0)),
@@ -238,6 +260,12 @@ def build_run_summary(arrays: dict[str, np.ndarray], *, task_summary: dict[str, 
             ),
             "projection_discrepancy_p95_abs_rad": _per_joint_percentile(
                 np.asarray(arrays.get("projection_discrepancy", np.empty((0,)))), 95.0
+            ),
+            "safety_projection_offset_p95_abs_rad": _per_joint_percentile(
+                np.asarray(arrays.get("safety_projection_offset", np.empty((0,)))), 95.0
+            ),
+            "planner_execution_qref_error_p95_abs_rad": _per_joint_percentile(
+                np.asarray(arrays.get("planner_execution_qref_error", np.empty((0,)))), 95.0
             ),
             "projection_activation_rate": float(np.mean(np.asarray(arrays.get("projection_active", np.empty(0))) != 0))
             if np.asarray(arrays.get("projection_active", np.empty(0))).size else float("nan"),

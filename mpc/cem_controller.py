@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Protocol
 
@@ -68,6 +68,9 @@ class CEMMPCResult:
     selected_predicted_state_sequence: np.ndarray
     sampling_std_start_mean: float
     sampling_std_end_mean: float
+    candidate_count: int = 0
+    valid_candidate_count: int = 0
+    candidate_diagnostics: dict[str, int] = field(default_factory=dict)
     branch_candidates: tuple[CEMCandidate, ...] = ()
 
 
@@ -185,7 +188,15 @@ class CEMMPCController:
         tail = self.mean[-1:].expand(shift, -1)
         return torch.cat([self.mean[shift:], tail], dim=0).detach().clone()
 
-    def _fallback(self, previous_q_ref: np.ndarray, start_time: float, reason: str) -> CEMMPCResult:
+    def _fallback(
+        self,
+        previous_q_ref: np.ndarray,
+        start_time: float,
+        reason: str,
+        candidate_count: int = 0,
+        valid_candidate_count: int = 0,
+        candidate_diagnostics: dict[str, int] | None = None,
+    ) -> CEMMPCResult:
         previous = np.asarray(previous_q_ref, dtype=np.float32)
         return CEMMPCResult(
             q_ref=previous.copy(),
@@ -210,6 +221,9 @@ class CEMMPCController:
             ),
             sampling_std_start_mean=float("nan"),
             sampling_std_end_mean=float("nan"),
+            candidate_count=candidate_count,
+            valid_candidate_count=valid_candidate_count,
+            candidate_diagnostics={} if candidate_diagnostics is None else dict(candidate_diagnostics),
         )
 
     def _valid_q_ref_sequence(self, sequence: torch.Tensor, batch_size: int) -> bool:
@@ -282,17 +296,32 @@ class CEMMPCController:
         final_samples: torch.Tensor | None = None
         final_evaluation: dict[str, torch.Tensor] | None = None
         final_elite_indices: torch.Tensor | None = None
+        candidate_count = 0
+        valid_candidate_count = 0
+        candidate_diagnostics: dict[str, int] = {}
 
         try:
             for _ in range(self.config.cem_iters):
                 samples = self._sample_population(mean, std)
                 evaluation = self.planner.evaluate(samples)
                 costs = evaluation["costs"].to(self.device)
+                candidate_count += int(costs.numel())
+                for diagnostic_name in (
+                    "requested_residual_valid", "projected_command_valid", "rollout_valid",
+                    "hard_state_constraint_valid", "cost_valid",
+                ):
+                    mask = evaluation.get(diagnostic_name)
+                    if isinstance(mask, torch.Tensor) and mask.numel() == costs.numel():
+                        invalid_count = int(mask.numel() - torch.sum(mask.to(dtype=torch.int64)).detach().cpu())
+                        candidate_diagnostics[f"{diagnostic_name}_invalid_count"] = (
+                            candidate_diagnostics.get(f"{diagnostic_name}_invalid_count", 0) + invalid_count
+                        )
                 if costs.ndim != 1 or costs.shape[0] != self.config.num_samples:
-                    return self._fallback(previous_q_ref, start_time, "invalid_cost_shape")
+                    return self._fallback(previous_q_ref, start_time, "invalid_cost_shape", candidate_count, valid_candidate_count, candidate_diagnostics)
                 valid = torch.isfinite(costs)
+                valid_candidate_count += int(torch.sum(valid).detach().cpu())
                 if not bool(torch.any(valid)):
-                    return self._fallback(previous_q_ref, start_time, "all_costs_invalid")
+                    return self._fallback(previous_q_ref, start_time, "all_costs_invalid", candidate_count, valid_candidate_count, candidate_diagnostics)
                 safe_costs = torch.where(valid, costs, torch.full_like(costs, float("inf")))
                 elite_indices = torch.topk(safe_costs, k=self.num_elites, largest=False).indices
                 elites = samples[elite_indices]
@@ -318,17 +347,17 @@ class CEMMPCController:
                 final_evaluation = evaluation
                 final_elite_indices = elite_indices.detach().clone()
         except RuntimeError as exc:
-            return self._fallback(previous_q_ref, start_time, f"planner_runtime_error:{exc}")
+            return self._fallback(previous_q_ref, start_time, f"planner_runtime_error:{exc}", candidate_count, valid_candidate_count, candidate_diagnostics)
 
         if best_sequence is None or best_q_ref_sequence is None or best_residual_sequence is None or best_predicted_state_sequence is None:
-            return self._fallback(previous_q_ref, start_time, "no_valid_sequence")
+            return self._fallback(previous_q_ref, start_time, "no_valid_sequence", candidate_count, valid_candidate_count, candidate_diagnostics)
         if (
             not torch.all(torch.isfinite(best_sequence))
             or not self._valid_q_ref_sequence(best_q_ref_sequence.unsqueeze(0), batch_size=1)
             or best_residual_sequence.shape != best_sequence.shape
             or not bool(torch.all(torch.isfinite(best_residual_sequence)))
         ):
-            return self._fallback(previous_q_ref, start_time, "invalid_selected_action")
+            return self._fallback(previous_q_ref, start_time, "invalid_selected_action", candidate_count, valid_candidate_count, candidate_diagnostics)
 
         mean_cost = float("nan")
         baseline_cost = float("nan")
@@ -504,5 +533,8 @@ class CEMMPCController:
             selected_predicted_state_sequence=selected_predicted_state_sequence.detach().cpu().numpy().astype(np.float32),
             sampling_std_start_mean=sampling_std_start_mean,
             sampling_std_end_mean=sampling_std_end_mean,
+            candidate_count=candidate_count,
+            valid_candidate_count=valid_candidate_count,
+            candidate_diagnostics=candidate_diagnostics,
             branch_candidates=branch_candidates,
         )

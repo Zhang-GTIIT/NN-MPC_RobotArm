@@ -94,7 +94,8 @@ def evaluate_branch_cost(
     low, high = torch.as_tensor(parent_env.joint_low, device=device), torch.as_tensor(parent_env.joint_high, device=device)
     return float(joint_space_tracking_cost(
         states_tensor, q_tensor, dq_tensor, actions_tensor, previous, velocity, low, high, cost_config,
-        nominal_q_ref=q_tensor[0], previous_residual=torch.zeros_like(previous),
+        nominal_q_ref=q_tensor[0], requested_residual=actions_tensor - q_tensor,
+        previous_residual=torch.zeros_like(previous),
         previous_residual_velocity=torch.zeros_like(previous),
     )[0].detach().cpu())
 

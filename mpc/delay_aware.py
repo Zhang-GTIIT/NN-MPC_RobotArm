@@ -28,6 +28,7 @@ class DelayedPlanPacket:
     branch_candidates: tuple[object, ...] = ()
     q_ref_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     requested_residual_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
+    planned_projection_offset_sequence: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
 
     @property
     def horizon(self) -> int:
@@ -50,16 +51,13 @@ def corrected_direct_ik_command(
     acceleration_limit: torch.Tensor,
     control_dt: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply a bounded correction while preserving exact Direct IK at zero.
+    """Apply a bounded correction through the physical command projection.
 
-    A zero correction bypasses the command-rate projection entirely, so a
-    fallback cannot inherit a stale MPC command.  Nonzero corrections are
-    projected with the *physical* limits supplied by the caller.
+    Zero correction means a constrained return towards the IK nominal.  It
+    must not bypass rate limits when a delayed packet expires.
     """
     nominal = clip_to_joint_limits(nominal_q_des, joint_low, joint_high, joint_limit_margin)
     requested = clip_to_joint_limits(nominal + correction, joint_low, joint_high, joint_limit_margin)
-    if bool(torch.all(torch.abs(correction) <= 1e-8)):
-        return nominal, torch.zeros_like(correction)
     command = project_position_command_sequence(
         requested.view(1, 1, -1),
         previous_q_ref=previous_q_ref,
@@ -72,6 +70,41 @@ def corrected_direct_ik_command(
         joint_limit_margin=joint_limit_margin,
     )[0, 0]
     return command, command - nominal
+
+
+def _limited_position_step_np(
+    requested_target: np.ndarray,
+    previous: np.ndarray,
+    previous_velocity: np.ndarray,
+    control_dt: float,
+    velocity_limit: np.ndarray,
+    acceleration_limit: np.ndarray,
+    low: np.ndarray,
+    high: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """NumPy counterpart of ``constraints._limited_position_step``."""
+    requested_target = np.clip(requested_target, low, high)
+    requested_velocity = (requested_target - previous) / control_dt
+    velocity = np.clip(
+        requested_velocity,
+        previous_velocity - acceleration_limit * control_dt,
+        previous_velocity + acceleration_limit * control_dt,
+    )
+    velocity = np.clip(velocity, -velocity_limit, velocity_limit)
+    distance_to_high = np.maximum(high - previous, 0.0)
+    distance_to_low = np.maximum(previous - low, 0.0)
+    positive_braking_velocity = (
+        np.sqrt(np.square(acceleration_limit * control_dt) + 2.0 * acceleration_limit * distance_to_high)
+        - acceleration_limit * control_dt
+    )
+    negative_braking_velocity = (
+        np.sqrt(np.square(acceleration_limit * control_dt) + 2.0 * acceleration_limit * distance_to_low)
+        - acceleration_limit * control_dt
+    )
+    velocity = np.minimum(velocity, np.maximum(positive_braking_velocity, 0.0))
+    velocity = np.maximum(velocity, -np.maximum(negative_braking_velocity, 0.0))
+    target = np.clip(previous + velocity * control_dt, low, high)
+    return target.astype(np.float32), ((target - previous) / control_dt).astype(np.float32)
 
 
 def corrected_direct_ik_command_np(
@@ -109,22 +142,24 @@ def project_executable_command_np(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Project one correction exactly as the ASAP execution layer does.
 
-    Returns the command, its executed correction relative to the clipped
-    nominal, and the command velocity.  The zero-correction Direct-IK bypass
-    deliberately remains exact, matching the safety fallback semantics.
+    Returns the command, its nominal offset, and the command velocity.  Zero
+    and nonzero corrections use the same braking-aware physical projection.
     """
     nominal = np.clip(np.asarray(nominal_q_ref, dtype=np.float32), joint_low + joint_limit_margin, joint_high - joint_limit_margin)
     requested_correction = np.asarray(requested_correction, dtype=np.float32)
     previous_command = np.asarray(previous_command, dtype=np.float32)
     previous_velocity = np.asarray(previous_velocity, dtype=np.float32)
-    if np.all(np.abs(requested_correction) <= 1e-8):
-        velocity = (nominal - previous_command) / control_dt
-        return nominal.astype(np.float32), np.zeros_like(nominal, dtype=np.float32), velocity.astype(np.float32)
     requested = np.clip(nominal + requested_correction, joint_low + joint_limit_margin, joint_high - joint_limit_margin)
-    requested_velocity = (requested - previous_command) / control_dt
-    velocity = np.clip(requested_velocity, previous_velocity - acceleration_limit * control_dt, previous_velocity + acceleration_limit * control_dt)
-    velocity = np.clip(velocity, -velocity_limit, velocity_limit)
-    command = np.clip(previous_command + velocity * control_dt, joint_low + joint_limit_margin, joint_high - joint_limit_margin)
+    command, velocity = _limited_position_step_np(
+        requested,
+        previous_command,
+        previous_velocity,
+        control_dt,
+        np.asarray(velocity_limit, dtype=np.float32),
+        np.asarray(acceleration_limit, dtype=np.float32),
+        np.asarray(joint_low, dtype=np.float32) + joint_limit_margin,
+        np.asarray(joint_high, dtype=np.float32) - joint_limit_margin,
+    )
     return command.astype(np.float32), (command - nominal).astype(np.float32), velocity.astype(np.float32)
 
 
