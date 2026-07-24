@@ -1,3 +1,4 @@
+"""Tests for aligned MPC history construction."""
 from __future__ import annotations
 
 import unittest

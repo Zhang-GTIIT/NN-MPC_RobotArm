@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_module(name: str, path: Path):
@@ -34,7 +34,10 @@ class ThreadedASAPDefaultTests(unittest.TestCase):
         self.assertEqual(args.multirate_mode, "threaded_asap")
         self.assertEqual(args.delay_protocol, "full")
         self.assertEqual(args.ik_preview_steps, 0)
-        self.assertEqual(args.planner_projection, "off")
+        self.assertEqual(args.planner_projection, "on")
+        self.assertEqual(args.planner_projection_backend, "compiled")
+        self.assertEqual(args.planner_projection_strategy, "two_stage")
+        self.assertEqual(args.horizon, 20)
         self.assertEqual(args.residual_cost_semantics, "requested")
         self.assertEqual(args.packet_residual_semantics, "requested")
         self.assertEqual(args.residual_feasibility_semantics, "finite")

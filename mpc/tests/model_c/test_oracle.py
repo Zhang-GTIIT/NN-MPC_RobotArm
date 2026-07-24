@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 DYNAMICS_ROOT = ROOT / "dynamics_modeling"
 for path in (ROOT, DYNAMICS_ROOT):
     if str(path) not in sys.path:
@@ -175,6 +175,7 @@ class OracleMPCTests(unittest.TestCase):
     def test_oracle_overrun_is_scheduled_at_fixed_logical_delay(self) -> None:
         args = RUN_CEM_MPC.parse_args([
             "--dynamics_backend", "mujoco_oracle", "--device", "cpu",
+            "--planner_projection", "off", "--planner_projection_strategy", "full",
             "--multirate_mode", "virtual_asap",
             "--reference_mode", "multi_joint_sine", "--episode_len", "12",
             "--max_execution_steps", "2", "--settle_steps", "1", "--horizon", "3",
@@ -199,7 +200,11 @@ class OracleMPCTests(unittest.TestCase):
         self.assertEqual(result["arrays"]["replan_deadline_miss"].tolist(), [1, 1])
 
     def test_oracle_rejects_non_virtual_asap_modes(self) -> None:
-        args = RUN_CEM_MPC.parse_args(["--dynamics_backend", "mujoco_oracle", "--multirate_mode", "threaded_asap"])
+        args = RUN_CEM_MPC.parse_args([
+            "--dynamics_backend", "mujoco_oracle",
+            "--planner_projection", "off", "--planner_projection_strategy", "full",
+            "--multirate_mode", "threaded_asap",
+        ])
         with self.assertRaisesRegex(ValueError, "only supports"):
             RUN_CEM_MPC.run_closed_loop_mpc(args)
 

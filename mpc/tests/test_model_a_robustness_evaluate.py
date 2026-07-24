@@ -14,7 +14,7 @@ from unittest import mock
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "test_model_a_robustness_evaluate", ROOT / "scripts" / "robustness" / "evaluate_model_a.py"
 )

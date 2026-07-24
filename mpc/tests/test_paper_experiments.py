@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DYNAMICS_ROOT = ROOT / "dynamics_modeling"
 for path in (ROOT, DYNAMICS_ROOT):
     if str(path) not in sys.path:
@@ -44,6 +44,7 @@ class DelayProtocolTests(unittest.TestCase):
     def test_zero_delay_plan_is_active_on_the_same_logical_tick(self) -> None:
         args = RUNNER.parse_args([
             "--dynamics_backend", "mujoco_oracle", "--device", "cpu",
+            "--planner_projection", "off", "--planner_projection_strategy", "full",
             "--multirate_mode", "virtual_asap", "--delay_protocol", "full",
             "--anticipation_delay_steps", "0", "--reference_mode", "multi_joint_sine",
             "--episode_len", "12", "--max_execution_steps", "2", "--settle_steps", "1",
@@ -58,6 +59,7 @@ class DelayProtocolTests(unittest.TestCase):
     def test_naive_packet_age_starts_at_zero_when_delay_expires(self) -> None:
         args = RUNNER.parse_args([
             "--dynamics_backend", "mujoco_oracle", "--device", "cpu",
+            "--planner_projection", "off", "--planner_projection_strategy", "full",
             "--multirate_mode", "virtual_asap", "--delay_protocol", "naive_delayed",
             "--anticipation_delay_steps", "1", "--reference_mode", "multi_joint_sine",
             "--episode_len", "12", "--max_execution_steps", "2", "--settle_steps", "1",

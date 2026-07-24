@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DYNAMICS_ROOT = ROOT / "dynamics_modeling"
 if str(DYNAMICS_ROOT) not in sys.path:
     sys.path.insert(0, str(DYNAMICS_ROOT))
@@ -329,7 +329,42 @@ class _BaselinePlanner:
         }
 
 
+class _TwoStagePlanner(_BaselinePlanner):
+    def evaluate(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
+        result = super().evaluate(action)
+        result["costs"] = torch.mean(torch.square(action - 1.0), dim=(1, 2))
+        return result
+
+    def evaluate_exact(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
+        return super().evaluate(action)
+
+
 class CEMBaselineTests(unittest.TestCase):
+    def test_two_stage_selects_only_from_exactly_validated_pool(self) -> None:
+        controller = CEMMPCController(
+            CEMMPCConfig(
+                horizon=3,
+                action_dim=1,
+                num_samples=8,
+                cem_iters=2,
+                elite_ratio=0.25,
+                force_baseline_candidate=True,
+                execute="lowest_cost",
+                selection_validation="exact_final_pool",
+                seed=7,
+            ),
+            planner=_TwoStagePlanner(),
+            joint_low=np.array([-1.0], dtype=np.float32),
+            joint_high=np.array([1.0], dtype=np.float32),
+        )
+        result = controller.plan(np.zeros(2, dtype=np.float32), np.zeros(1, dtype=np.float32))
+        self.assertFalse(result.failure)
+        self.assertEqual(result.selection_mode, "baseline")
+        np.testing.assert_allclose(result.selected_action_sequence, 0.0)
+        self.assertGreater(result.candidate_diagnostics["exact_validation_count"], 0)
+        self.assertGreater(result.candidate_diagnostics["exact_valid_count"], 0)
+        self.assertEqual(result.candidate_diagnostics["exact_selection_changed"], 1)
+
     def test_zero_residual_is_forced_and_selected_when_optimal(self) -> None:
         controller = CEMMPCController(
             CEMMPCConfig(

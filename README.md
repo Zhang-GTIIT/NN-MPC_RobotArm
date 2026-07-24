@@ -134,7 +134,7 @@ outputs/            生成的模型、参考和运行结果
 快速验证 residual MPC 单元测试：
 
 ```bash
-conda run -n pendulum-rl python -m unittest mpc/test_residual_mpc.py -v
+conda run -n pendulum-rl python -m unittest mpc/tests/test_residual_mpc.py -v
 ```
 
 完整项目测试入口见 [dynamics_modeling/README.md](dynamics_modeling/README.md)。

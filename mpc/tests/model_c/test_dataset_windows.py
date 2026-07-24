@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 DYNAMICS_ROOT = ROOT / "dynamics_modeling"
 if str(DYNAMICS_ROOT) not in sys.path:
     sys.path.insert(0, str(DYNAMICS_ROOT))

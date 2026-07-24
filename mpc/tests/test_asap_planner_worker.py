@@ -1,3 +1,4 @@
+"""Tests for the threaded ASAP planner worker."""
 from __future__ import annotations
 
 import unittest
@@ -10,6 +11,23 @@ from mpc.delay_aware import project_executable_command_np
 
 
 class ExecutableAnchorProjectionTests(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "compiled projection requires CUDA")
+    def test_compiled_projection_matches_eager_at_h20(self) -> None:
+        generator = torch.Generator(device="cuda").manual_seed(11)
+        requested = torch.randn((128, 20, 6), generator=generator, device="cuda")
+        kwargs = dict(
+            previous_q_ref=torch.zeros(6, device="cuda"),
+            previous_q_ref_velocity=torch.zeros(6, device="cuda"),
+            control_dt=0.01,
+            velocity_limit=torch.tensor([1, 1, 1, 2, 2, 2], device="cuda"),
+            acceleration_limit=torch.tensor([5, 5, 5, 10, 10, 12.5], device="cuda"),
+            joint_low=torch.full((6,), -2.0, device="cuda"),
+            joint_high=torch.full((6,), 2.0, device="cuda"),
+            joint_limit_margin=0.02,
+        )
+        eager = project_position_command_sequence(requested, backend="eager", **kwargs)
+        compiled = project_position_command_sequence(requested, backend="compiled", **kwargs)
+        torch.testing.assert_close(compiled, eager, atol=2e-6, rtol=2e-6)
     def test_numpy_and_torch_sequence_projection_match_with_braking(self) -> None:
         rng = np.random.default_rng(7)
         requested = rng.uniform(-0.9, 0.9, size=(12, 3)).astype(np.float32)

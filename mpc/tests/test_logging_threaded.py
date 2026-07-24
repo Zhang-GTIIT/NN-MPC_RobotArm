@@ -1,3 +1,4 @@
+"""Tests for threaded MPC summary metrics."""
 from __future__ import annotations
 
 import unittest

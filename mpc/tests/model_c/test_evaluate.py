@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location("test_model_c_evaluate", ROOT / "scripts" / "model_c" / "evaluate.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
