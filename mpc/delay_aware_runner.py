@@ -98,7 +98,10 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
         rollout = PlannerRolloutConfig(
             mpc_policy="residual", q_ref_velocity_limit=t(physical_v), q_ref_acceleration_limit=t(physical_a),
             residual_max=t(residual_max), joint_limit_margin=args.joint_limit_margin,
-            rollout_batch_size=args.rollout_batch_size, project_residual_kinematics=args.planner_projection == "on",
+            rollout_batch_size=args.rollout_batch_size,
+            project_residual_kinematics=args.planner_projection == "on" and args.planner_projection_strategy == "full",
+            projection_backend=args.planner_projection_backend,
+            projection_strategy=args.planner_projection_strategy,
             residual_cost_semantics=args.residual_cost_semantics,
             residual_feasibility_semantics=args.residual_feasibility_semantics,
         )
@@ -390,6 +393,11 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
                         smoothing_alpha=args.smoothing_alpha, temporal_noise_alpha=args.temporal_noise_alpha,
                         reset_std_each_step=args.reset_std_each_step, uniform_sample_ratio=args.uniform_sample_ratio,
                         force_baseline_candidate=True, execute=args.cem_execute, seed=args.seed, device=str(device),
+                        selection_validation=(
+                            "exact_final_pool"
+                            if args.planner_projection_strategy == "two_stage"
+                            else "none"
+                        ),
                         alternative_distance_scale=residual_max,
                     ), planner, env.joint_low, env.joint_high)
                     # CUDA's first rollout is a runtime initialisation artefact,
@@ -500,6 +508,8 @@ def run(args: Any, api: dict[str, Any]) -> dict[str, Any]:
         "controller_mode": np.asarray("mpc"), "mpc_policy": np.asarray("residual"), "cost_profile": np.asarray(args.cost_profile),
         "control_semantics_version": np.asarray(2, dtype=np.int64), "projection_semantics_version": np.asarray(2, dtype=np.int64),
         "projection_backend": np.asarray("shared_physical_v2"), "planner_projection": np.asarray(args.planner_projection),
+        "planner_projection_backend": np.asarray(args.planner_projection_backend),
+        "planner_projection_strategy": np.asarray(args.planner_projection_strategy),
         "residual_cost_semantics": np.asarray(args.residual_cost_semantics),
         "packet_residual_semantics": np.asarray(args.packet_residual_semantics),
         "residual_feasibility_semantics": np.asarray(args.residual_feasibility_semantics),

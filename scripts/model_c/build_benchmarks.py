@@ -51,7 +51,7 @@ def main() -> None:
     parser.add_argument("--task_reference_dir", required=True, help="Contains immutable <type>_<index>/reference.npz bundles for every benchmark type.")
     parser.add_argument("--completion_marker", default="C2_COMPLETE")
     parser.add_argument("--seed", type=int, default=20260720)
-    parser.add_argument("--horizon", type=int, default=25)
+    parser.add_argument("--horizon", type=int, default=20)
     parser.add_argument("--delay", type=int, required=True)
     parser.add_argument("--disjoint_from", default=None, help="Required for final: development manifest whose reference files/hashes must not overlap.")
     args = parser.parse_args()

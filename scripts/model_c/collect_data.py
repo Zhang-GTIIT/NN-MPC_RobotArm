@@ -53,7 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timing_json", default=None, type=str)
     parser.add_argument("--round_name", default="round1", type=str)
     parser.set_defaults(
-        model_type="gru", history_len=16, horizon=25, num_samples=128, cem_iters=2,
+        model_type="gru", history_len=16, horizon=20, num_samples=128, cem_iters=2,
         replan_interval_steps=5, multirate_mode="virtual_asap", episode_len=500,
         force_baseline_candidate=True,
     )
@@ -170,7 +170,7 @@ def main() -> None:
         raise ValueError(f"Model-C collection forbids robustness perturbations: {robustness_levels}")
     if args.multirate_mode != "virtual_asap" or args.episode_len != 500:
         raise ValueError("Model-C collection requires --multirate_mode virtual_asap and --episode_len 500")
-    expected = {"model_type": "gru", "history_len": 16, "horizon": 25, "branch_horizon": 25, "num_samples": 128, "cem_iters": 2, "replan_interval_steps": 5}
+    expected = {"model_type": "gru", "history_len": 16, "horizon": 20, "branch_horizon": 25, "num_samples": 128, "cem_iters": 2, "replan_interval_steps": 5}
     mismatch = {name: (getattr(args, name), value) for name, value in expected.items() if getattr(args, name) != value}
     if mismatch:
         raise ValueError(f"Model-C collection is fixed to {expected}; received incompatible values {mismatch}")

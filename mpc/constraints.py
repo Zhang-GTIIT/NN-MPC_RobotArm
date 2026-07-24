@@ -16,7 +16,13 @@ def clip_to_joint_limits(q_ref: torch.Tensor, joint_low: torch.Tensor, joint_hig
     return torch.minimum(torch.maximum(q_ref, low), high)
 
 
-def _batch_joint_vector(value: torch.Tensor | float | None, reference: torch.Tensor, name: str) -> torch.Tensor | None:
+def _batch_joint_vector(
+    value: torch.Tensor | float | None,
+    reference: torch.Tensor,
+    name: str,
+    *,
+    validate_values: bool = True,
+) -> torch.Tensor | None:
     if value is None:
         return None
     vector = torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
@@ -24,7 +30,9 @@ def _batch_joint_vector(value: torch.Tensor | float | None, reference: torch.Ten
         vector = vector.expand(reference.shape[-1])
     if vector.ndim != 1 or vector.shape[0] != reference.shape[-1]:
         raise ValueError(f"{name} must be a scalar or shape ({reference.shape[-1]},), got {tuple(vector.shape)}")
-    if not bool(torch.all(torch.isfinite(vector))) or bool(torch.any(vector <= 0)):
+    if validate_values and (
+        not bool(torch.all(torch.isfinite(vector))) or bool(torch.any(vector <= 0))
+    ):
         raise ValueError(f"{name} must contain finite positive values")
     return vector.view(1, -1)
 
@@ -82,41 +90,17 @@ def _limited_position_step(
     return target, (target - previous) / control_dt
 
 
-def project_position_command_sequence(
+def _project_position_command_sequence_core(
     requested_q_ref_sequence: torch.Tensor,
-    previous_q_ref: torch.Tensor,
-    previous_q_ref_velocity: torch.Tensor,
+    previous: torch.Tensor,
+    previous_velocity: torch.Tensor,
     control_dt: float,
-    velocity_limit: torch.Tensor | float,
-    acceleration_limit: torch.Tensor | float,
-    joint_low: torch.Tensor,
-    joint_high: torch.Tensor,
-    joint_limit_margin: float = 0.0,
+    velocity_limit: torch.Tensor,
+    acceleration_limit: torch.Tensor,
+    low: torch.Tensor,
+    high: torch.Tensor,
 ) -> torch.Tensor:
-    """Return an executable sequence nearest to absolute position requests.
-
-    ``requested_q_ref_sequence`` has shape ``[batch, horizon, joints]``.  The
-    preceding command and velocity are part of the projection, so the first
-    element is continuous with the command actually sent by the previous MPC
-    cycle.
-    """
-    if control_dt <= 0:
-        raise ValueError("control_dt must be positive")
-    if requested_q_ref_sequence.ndim != 3:
-        raise ValueError("requested_q_ref_sequence must have shape [batch, horizon, action_dim]")
-    velocity_limit = _batch_joint_vector(velocity_limit, requested_q_ref_sequence, "velocity_limit")
-    acceleration_limit = _batch_joint_vector(acceleration_limit, requested_q_ref_sequence, "acceleration_limit")
-    if velocity_limit is None or acceleration_limit is None:
-        raise ValueError("position-command projection requires velocity_limit and acceleration_limit")
-    previous = _batch_previous(previous_q_ref, requested_q_ref_sequence, "previous_q_ref")
-    previous_velocity = _batch_previous(
-        previous_q_ref_velocity, requested_q_ref_sequence, "previous_q_ref_velocity"
-    )
-    low, high = joint_bounds_with_margin(
-        joint_low.to(requested_q_ref_sequence.device, requested_q_ref_sequence.dtype),
-        joint_high.to(requested_q_ref_sequence.device, requested_q_ref_sequence.dtype),
-        joint_limit_margin,
-    )
+    """Pure fixed-shape projection core suitable for full-graph compilation."""
     limited = []
     for step_idx in range(requested_q_ref_sequence.shape[1]):
         target, previous_velocity = _limited_position_step(
@@ -132,6 +116,78 @@ def project_position_command_sequence(
         limited.append(target)
         previous = target
     return torch.stack(limited, dim=1)
+
+
+_COMPILED_POSITION_PROJECTOR = None
+
+
+def _compiled_position_projector():
+    global _COMPILED_POSITION_PROJECTOR
+    if _COMPILED_POSITION_PROJECTOR is None:
+        _COMPILED_POSITION_PROJECTOR = torch.compile(
+            _project_position_command_sequence_core,
+            fullgraph=True,
+            mode="default",
+        )
+    return _COMPILED_POSITION_PROJECTOR
+
+
+def project_position_command_sequence(
+    requested_q_ref_sequence: torch.Tensor,
+    previous_q_ref: torch.Tensor,
+    previous_q_ref_velocity: torch.Tensor,
+    control_dt: float,
+    velocity_limit: torch.Tensor | float,
+    acceleration_limit: torch.Tensor | float,
+    joint_low: torch.Tensor,
+    joint_high: torch.Tensor,
+    joint_limit_margin: float = 0.0,
+    backend: str = "eager",
+) -> torch.Tensor:
+    """Return an executable sequence nearest to absolute position requests.
+
+    ``requested_q_ref_sequence`` has shape ``[batch, horizon, joints]``.  The
+    preceding command and velocity are part of the projection, so the first
+    element is continuous with the command actually sent by the previous MPC
+    cycle.
+    """
+    if control_dt <= 0:
+        raise ValueError("control_dt must be positive")
+    if requested_q_ref_sequence.ndim != 3:
+        raise ValueError("requested_q_ref_sequence must have shape [batch, horizon, action_dim]")
+    if backend not in {"eager", "compiled"}:
+        raise ValueError("projection backend must be 'eager' or 'compiled'")
+    velocity_limit = _batch_joint_vector(
+        velocity_limit, requested_q_ref_sequence, "velocity_limit", validate_values=backend == "eager"
+    )
+    acceleration_limit = _batch_joint_vector(
+        acceleration_limit, requested_q_ref_sequence, "acceleration_limit", validate_values=backend == "eager"
+    )
+    if velocity_limit is None or acceleration_limit is None:
+        raise ValueError("position-command projection requires velocity_limit and acceleration_limit")
+    previous = _batch_previous(previous_q_ref, requested_q_ref_sequence, "previous_q_ref")
+    previous_velocity = _batch_previous(
+        previous_q_ref_velocity, requested_q_ref_sequence, "previous_q_ref_velocity"
+    )
+    low = joint_low.to(requested_q_ref_sequence.device, requested_q_ref_sequence.dtype) + float(joint_limit_margin)
+    high = joint_high.to(requested_q_ref_sequence.device, requested_q_ref_sequence.dtype) - float(joint_limit_margin)
+    if backend == "eager" and bool(torch.any(low >= high)):
+        raise ValueError("joint_limit_margin leaves no valid joint range")
+    projector = (
+        _project_position_command_sequence_core
+        if backend == "eager"
+        else _compiled_position_projector()
+    )
+    return projector(
+        requested_q_ref_sequence,
+        previous,
+        previous_velocity,
+        control_dt,
+        velocity_limit,
+        acceleration_limit,
+        low.view(1, -1),
+        high.view(1, -1),
+    )
 
 
 def project_nominal_q_ref_sequence(

@@ -34,7 +34,7 @@ def main() -> None:
     parser.add_argument("--output_dir", default="outputs/robustness/references")
     parser.add_argument("--model_xml", default="dynamics_modeling/ABB_IRB2400.xml")
     parser.add_argument("--cases_per_type", type=int, default=10)
-    parser.add_argument("--horizon", type=int, default=25)
+    parser.add_argument("--horizon", type=int, default=20)
     parser.add_argument("--delay", required=True, type=int)
     parser.add_argument("--seed", type=int, default=20260722)
     parser.add_argument("--overwrite", action="store_true")

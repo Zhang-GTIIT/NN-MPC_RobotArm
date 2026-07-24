@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser = RUNNER.build_arg_parser()
     parser.add_argument("--plans", default=500, type=int)
     parser.add_argument("--output_path", default="outputs/robustness/timing/model_a.json")
-    parser.set_defaults(model_type="gru", history_len=16, horizon=25, num_samples=128, cem_iters=2,
+    parser.set_defaults(model_type="gru", history_len=16, horizon=20, num_samples=128, cem_iters=2,
                         replan_interval_steps=5, multirate_mode="virtual_asap", episode_len=500)
     return parser.parse_args()
 

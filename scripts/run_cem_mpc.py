@@ -202,8 +202,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--planner_projection",
         choices=["on", "off"],
-        default="off",
-        help="Optionally project every planner candidate through command kinematics. Execution always uses the physical safety projection.",
+        default="on",
+        help="Project planner candidates through command kinematics (default: on). Execution also uses the physical safety projection.",
+    )
+    parser.add_argument(
+        "--planner_projection_backend",
+        choices=["eager", "compiled"],
+        default="compiled",
+        help="Exact planner projection implementation. Compiled preserves the eager mathematics after one-time warmup.",
+    )
+    parser.add_argument(
+        "--planner_projection_strategy",
+        choices=["full", "two_stage"],
+        default="two_stage",
+        help="Full projects every population; two_stage searches cheaply then exactly validates final elites/mean/best/baseline.",
     )
     parser.add_argument(
         "--residual_cost_semantics",
@@ -636,7 +648,14 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
         raise ValueError("recovery_min_tracking_error must be non-negative")
     if args.planner_guard_ms < 0.0 or args.planner_min_interval_ms < 0.0:
         raise ValueError("planner_guard_ms and planner_min_interval_ms must be non-negative")
+    using_two_stage_mpc = args.controller_mode == "mpc" and args.planner_projection_strategy == "two_stage"
+    if using_two_stage_mpc and args.planner_projection != "on":
+        raise ValueError("two_stage planner projection requires --planner_projection on")
+    if using_two_stage_mpc and args.mpc_policy != "residual":
+        raise ValueError("two_stage planner projection requires residual MPC")
     dynamics_backend = getattr(args, "dynamics_backend", "learned")
+    if using_two_stage_mpc and dynamics_backend != "learned":
+        raise ValueError("two_stage planner projection currently supports only learned dynamics")
     robustness = _robustness_config(args)
     if robustness.enabled and dynamics_backend == "mujoco_oracle":
         raise ValueError("Robustness perturbations are only defined for learned MPC and Direct IK, not mujoco_oracle")
@@ -844,6 +863,9 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
                 residual_max=torch.as_tensor(residual_max, dtype=torch.float32, device=device),
                 joint_limit_margin=args.joint_limit_margin,
                 rollout_batch_size=args.rollout_batch_size,
+                project_residual_kinematics=args.planner_projection == "on" and args.planner_projection_strategy == "full",
+                projection_backend=args.planner_projection_backend,
+                projection_strategy=args.planner_projection_strategy,
                 residual_cost_semantics=args.residual_cost_semantics,
                 residual_feasibility_semantics=args.residual_feasibility_semantics,
             )
@@ -1015,6 +1037,11 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
                                 execute=args.cem_execute,
                                 seed=args.seed,
                                 device=str(device),
+                                selection_validation=(
+                                    "exact_final_pool"
+                                    if args.planner_projection_strategy == "two_stage"
+                                    else "none"
+                                ),
                             ),
                             planner=planner,
                             joint_low=env.joint_low,
@@ -1353,6 +1380,8 @@ def run_closed_loop_mpc(args: argparse.Namespace, *, activation_observer: Any | 
         "projection_semantics_version": np.asarray(2, dtype=np.int64),
         "projection_backend": np.asarray("shared_physical_v2"),
         "planner_projection": np.asarray(args.planner_projection),
+        "planner_projection_backend": np.asarray(args.planner_projection_backend),
+        "planner_projection_strategy": np.asarray(args.planner_projection_strategy),
         "residual_cost_semantics": np.asarray(args.residual_cost_semantics),
         "packet_residual_semantics": np.asarray(args.packet_residual_semantics),
         "residual_feasibility_semantics": np.asarray(args.residual_feasibility_semantics),

@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--reference_dir", default="outputs/robustness/references")
     parser.add_argument("--cases_per_type", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260722)
-    parser.add_argument("--horizon", type=int, default=25)
+    parser.add_argument("--horizon", type=int, default=20)
     parser.add_argument("--delay", required=True, type=int)
     args = parser.parse_args()
     if args.cases_per_type <= 0 or args.horizon <= 0 or args.delay <= 0:

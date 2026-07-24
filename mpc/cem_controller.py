@@ -12,6 +12,9 @@ class PlannerProtocol(Protocol):
     def evaluate(self, candidate_action: torch.Tensor) -> dict[str, torch.Tensor]:
         ...
 
+    def evaluate_exact(self, candidate_action: torch.Tensor) -> dict[str, torch.Tensor]:
+        ...
+
 
 @dataclass(frozen=True)
 class CEMMPCConfig:
@@ -32,6 +35,7 @@ class CEMMPCConfig:
     device: str = "cpu"
     execute: str = "lowest_cost"
     alternative_distance_scale: np.ndarray | None = None
+    selection_validation: str = "none"
 
 
 @dataclass
@@ -94,6 +98,8 @@ class CEMMPCController:
             raise ValueError("init_std and min_std must be positive")
         if config.force_baseline_candidate and config.num_samples < 3:
             raise ValueError("force_baseline_candidate requires at least three samples")
+        if config.selection_validation not in {"none", "exact_final_pool"}:
+            raise ValueError("selection_validation must be 'none' or 'exact_final_pool'")
         self.config = config
         self.planner = planner
         self.device = torch.device(config.device)
@@ -278,6 +284,55 @@ class CEMMPCController:
             return None
         return costs[0], q_ref_sequences[0], residual_sequences[0], terms, predicted_next_state, pred_state_sequence[0]
 
+    def _exact_final_pool(
+        self,
+        final_samples: torch.Tensor,
+        final_elite_indices: torch.Tensor,
+        best_sequence: torch.Tensor,
+        mean: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[set[str]], list[int]]:
+        """Deduplicate, pad, and exactly evaluate final elites/best/mean/baseline."""
+        entries: list[tuple[str, torch.Tensor]] = [
+            *[("elite", final_samples[index]) for index in final_elite_indices],
+            ("best", best_sequence),
+            ("mean", mean),
+            ("baseline", torch.zeros_like(mean)),
+        ]
+        unique: list[torch.Tensor] = []
+        roles: list[set[str]] = []
+        entry_to_unique: list[int] = []
+        for role, sequence in entries:
+            match = next(
+                (
+                    index
+                    for index, existing in enumerate(unique)
+                    if bool(torch.equal(sequence, existing))
+                ),
+                None,
+            )
+            if match is None:
+                match = len(unique)
+                unique.append(sequence)
+                roles.append(set())
+            roles[match].add(role)
+            entry_to_unique.append(match)
+        pool_size = self.num_elites + 3
+        valid_count = len(unique)
+        while len(unique) < pool_size:
+            unique.append(torch.zeros_like(mean))
+            roles.append({"padding"})
+        pool = torch.stack(unique[:pool_size])
+        evaluator = getattr(self.planner, "evaluate_exact", None)
+        if evaluator is None:
+            raise RuntimeError("exact_final_pool requires planner.evaluate_exact")
+        evaluation = evaluator(pool)
+        costs = evaluation["costs"].to(self.device)
+        if costs.shape != (pool_size,):
+            raise RuntimeError("invalid exact final-pool cost shape")
+        mask = torch.arange(pool_size, device=self.device) < valid_count
+        evaluation["costs"] = torch.where(mask, costs, torch.full_like(costs, float("inf")))
+        return pool, evaluation, roles, entry_to_unique
+
     def plan(self, current_state: np.ndarray, previous_q_ref: np.ndarray, *, warm_start_shift_steps: int | None = None) -> CEMMPCResult:
         del current_state
         start_time = perf_counter()
@@ -299,6 +354,10 @@ class CEMMPCController:
         candidate_count = 0
         valid_candidate_count = 0
         candidate_diagnostics: dict[str, int] = {}
+        exact_role_evaluations: dict[
+            str,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], np.ndarray, torch.Tensor],
+        ] = {}
 
         try:
             for _ in range(self.config.cem_iters):
@@ -351,6 +410,84 @@ class CEMMPCController:
 
         if best_sequence is None or best_q_ref_sequence is None or best_residual_sequence is None or best_predicted_state_sequence is None:
             return self._fallback(previous_q_ref, start_time, "no_valid_sequence", candidate_count, valid_candidate_count, candidate_diagnostics)
+        if self.config.selection_validation == "exact_final_pool":
+            if final_samples is None or final_elite_indices is None:
+                return self._fallback(previous_q_ref, start_time, "missing_exact_final_pool", candidate_count, valid_candidate_count, candidate_diagnostics)
+            approximate_best = best_sequence.detach().clone()
+            try:
+                pool, exact, roles, entry_to_unique = self._exact_final_pool(
+                    final_samples, final_elite_indices, approximate_best, mean
+                )
+            except RuntimeError as exc:
+                return self._fallback(previous_q_ref, start_time, f"exact_validation_error:{exc}", candidate_count, valid_candidate_count, candidate_diagnostics)
+            exact_costs = exact["costs"].to(self.device)
+            exact_q = exact["q_ref_sequences"].to(self.device)
+            exact_residual = exact.get("residual_sequences", pool).to(self.device)
+            exact_predicted = exact["pred_states"].to(self.device)
+            exact_valid = torch.isfinite(exact_costs)
+            exact_count = int(torch.sum(exact_valid).detach().cpu())
+            candidate_count += int(len(exact_costs))
+            valid_candidate_count += exact_count
+            candidate_diagnostics["approx_candidate_count"] = candidate_count - len(exact_costs)
+            candidate_diagnostics["exact_validation_count"] = int(sum("padding" not in role for role in roles))
+            candidate_diagnostics["exact_valid_count"] = exact_count
+            if not bool(torch.any(exact_valid)):
+                return self._fallback(previous_q_ref, start_time, "all_exact_candidates_invalid", candidate_count, valid_candidate_count, candidate_diagnostics)
+
+            def exact_tuple(index: int):
+                terms, predicted_next = self._diagnostics_from_evaluation(exact, index)
+                return (
+                    exact_costs[index],
+                    exact_q[index],
+                    exact_residual[index],
+                    terms,
+                    predicted_next,
+                    exact_predicted[index],
+                )
+
+            role_preference = {"baseline": 0, "mean": 1, "best": 2, "elite": 3}
+            valid_indices = [index for index in range(len(roles)) if bool(exact_valid[index])]
+            selected_index = min(
+                valid_indices,
+                key=lambda index: (
+                    float(exact_costs[index].detach().cpu()),
+                    min(role_preference.get(role, 4) for role in roles[index]),
+                ),
+            )
+            selected_exact = exact_tuple(selected_index)
+            best_cost, best_q_ref_sequence, best_residual_sequence = selected_exact[:3]
+            best_cost_terms, best_predicted_next_state, best_predicted_state_sequence = selected_exact[3:]
+            best_sequence = pool[selected_index].detach().clone()
+            approximate_best_unique = entry_to_unique[self.num_elites]
+            candidate_diagnostics["exact_selection_changed"] = int(selected_index != approximate_best_unique)
+            approximate_costs = final_evaluation.get("costs")
+            approximate_rank = -1
+            if isinstance(approximate_costs, torch.Tensor):
+                matching = torch.all(
+                    final_samples == pool[selected_index].unsqueeze(0), dim=(1, 2)
+                )
+                if bool(torch.any(matching)):
+                    sample_index = int(torch.nonzero(matching, as_tuple=False)[0, 0])
+                    finite_costs = torch.where(
+                        torch.isfinite(approximate_costs),
+                        approximate_costs,
+                        torch.full_like(approximate_costs, float("inf")),
+                    )
+                    approximate_rank = int(
+                        torch.sum(finite_costs < finite_costs[sample_index]).detach().cpu()
+                    ) + 1
+            candidate_diagnostics["exact_selected_approx_rank"] = approximate_rank
+            for role, entry_index in (
+                ("best", self.num_elites),
+                ("mean", self.num_elites + 1),
+                ("baseline", self.num_elites + 2),
+            ):
+                exact_role_evaluations[role] = exact_tuple(entry_to_unique[entry_index])
+            elite_indices_in_pool = entry_to_unique[: self.num_elites]
+            elite_mean_cost = torch.stack([exact_costs[index] for index in elite_indices_in_pool]).mean()
+            final_evaluation = exact
+            final_samples = pool
+            final_elite_indices = torch.as_tensor(elite_indices_in_pool, device=self.device)
         if (
             not torch.all(torch.isfinite(best_sequence))
             or not self._valid_q_ref_sequence(best_q_ref_sequence.unsqueeze(0), batch_size=1)
@@ -371,7 +508,7 @@ class CEMMPCController:
         selected_predicted_state_sequence = best_predicted_state_sequence
         mean_evaluation = None
         if self.config.execute in {"mean", "lowest_cost"}:
-            mean_evaluation = self._evaluate_sequence(mean)
+            mean_evaluation = exact_role_evaluations.get("mean") or self._evaluate_sequence(mean)
             if mean_evaluation is not None:
                 mean_cost_tensor, mean_q_ref_sequence, mean_residual_sequence, mean_cost_terms, mean_predicted_next_state, mean_predicted_state_sequence = mean_evaluation
                 mean_cost = float(mean_cost_tensor.detach().cpu())
@@ -390,7 +527,7 @@ class CEMMPCController:
 
         baseline_evaluation = None
         if self.config.force_baseline_candidate:
-            baseline_evaluation = self._evaluate_sequence(torch.zeros_like(mean))
+            baseline_evaluation = exact_role_evaluations.get("baseline") or self._evaluate_sequence(torch.zeros_like(mean))
             if baseline_evaluation is not None:
                 baseline_cost = float(baseline_evaluation[0].detach().cpu())
 
